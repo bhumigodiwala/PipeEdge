@@ -105,7 +105,7 @@ def _uint8_to_uint32(tensor):
     return tensor.view('uint32')
 
 
-def tensor_encode(input_data, quant_bit):
+def tensor_encode(input_data, quant_bit, clamp_value=None):
     """
         The input to the encoder should be a torch.Tensor
         We first cast it to a np.array, then do everything else
@@ -114,11 +114,21 @@ def tensor_encode(input_data, quant_bit):
         return [input_data, torch.tensor(input_data.shape), torch.tensor(1.0), torch.tensor(0.0)]
 
     input_data = input_data.numpy()
+    if isinstance(clamp_value, torch.Tensor):
+        clamp_value = clamp_value.item()
+    elif isinstance(clamp_value, numpy.ndarray):
+        clamp_value = np.asscalar(clamp_value)
     shape = input_data.shape
     # ensure the input is scaled to [0,1],
-    shift = input_data.min()
+    if clamp_value:
+        shift = -clamp_value if input_data.min()>(-clamp_value) else input_data.min()
+    else:
+        shift = input_data.min()
     input_data = input_data - shift
-    scale_factor = input_data.max()
+    if clamp_value:
+        scale_factor = (clamp_value + shift) if  input_data.max()<(clamp_value + shift) else input_data.max()
+    else:
+        scale_factor = input_data.max()
     rescale_input = input_data/scale_factor
     # quant
     _, int_map = _quant_op(rescale_input, quant_bit)

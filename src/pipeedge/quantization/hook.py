@@ -15,6 +15,14 @@ def forward_hook_quant_encode(module, _input_arg, output: Union[Tensor, Tuple[Te
         comm_tuple += tensor_encode(tensor, quant_bits[1])
     return tuple(comm_tuple)
 
+def forward_hook_quant_encode_with_clamp(module, input_tensor, output, clamp_values):
+    """encode tensor in the forward hook (after each module)"""
+    assert isinstance(output, tuple)
+    quant_bits = module.quant_bits.tolist()
+    comm_tuple = []
+    for idx, tensor in enumerate(output):
+        comm_tuple += tensor_encode(tensor, quant_bits[1], clamp_values[idx])
+    return tuple(comm_tuple)
 
 def forward_pre_hook_quant_decode(module, input_arg: Tuple[Tuple[Tensor, ...]]):
     """decode tensor in the preforward hook (before each module)"""
