@@ -116,7 +116,7 @@ def tensor_encode(input_data, quant_bit, clamp_value=None):
     input_data = input_data.numpy()
     if isinstance(clamp_value, torch.Tensor):
         clamp_value = clamp_value.item()
-    elif isinstance(clamp_value, numpy.ndarray):
+    elif isinstance(clamp_value, np.ndarray):
         clamp_value = np.asscalar(clamp_value)
     shape = input_data.shape
     # ensure the input is scaled to [0,1],

@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 from torchvision.transforms import ToTensor, Normalize, Resize, Compose
 from transformers import DeiTFeatureExtractor, ViTFeatureExtractor
-from pipeedge.quantization.hook import forward_hook_quant_encode_with_clamp, forward_pre_hook_quant_decode
+from pipeedge.quantization.hook import forward_hook_quant_encode, forward_hook_quant_encode_with_clamp, forward_pre_hook_quant_decode
 from pipeedge.quantization.clamp_op import clamp
 from runtime import _get_default_quant
 import model_cfg
@@ -71,7 +71,10 @@ def _forward_model(input_tensor, model_shards, stage_layers, is_clamp=True, mode
             temp_tensor = forward_pre_hook_quant_decode(shard, temp_tensor)
 
         # forward
-        if isinstance(temp_tensor[0], tuple):
+        # import ipdb; ipdb.set_trace()
+        if isinstance(temp_tensor[0], tuple) and len(temp_tensor[0]) == 2:
+            temp_tensor = temp_tensor[0]
+        elif isinstance(temp_tensor, tuple) and isinstance(temp_tensor[0], torch.Tensor):
             temp_tensor = temp_tensor[0]
         temp_tensor = shard(temp_tensor)
 
@@ -109,10 +112,15 @@ def _forward_model(input_tensor, model_shards, stage_layers, is_clamp=True, mode
                         temp_clamp_list.append(clamp_value)
                     temp_tensor = tuple(temp_tensors_list)
                 elif len(temp_tensor) == 1:
-                    temp_tensor, clamp_value = clamp(tensor, shard.quant_bits[1].item(), layer_type=clamp_types[0])
+                    if isinstance(temp_tensor, tuple):
+                        temp_tensor = temp_tensor[0]
+                    temp_tensor, clamp_value = clamp(temp_tensor, shard.quant_bits[1].item(), layer_type=clamp_types[0])
                     temp_clamp_list.append(clamp_value)
-            # do encoder
-            temp_tensor = (forward_hook_quant_encode_with_clamp(shard, None, temp_tensor, temp_clamp_list),)
+                    temp_tensor = (temp_tensor,)
+                # do encoder
+                temp_tensor = (forward_hook_quant_encode_with_clamp(shard, None, temp_tensor, temp_clamp_list),)
+            else:
+                temp_tensor = (forward_hook_quant_encode(shard, None, temp_tensor),)
     return temp_tensor
 
 def evaluation(args):
