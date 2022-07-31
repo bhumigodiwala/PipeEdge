@@ -1,4 +1,4 @@
-""" Evaluate accuracy on ImageNet dataset of EdgePipe """
+""" Evaluate accuracy on ImageNet dataset of PipeEdge """
 import os
 import argparse
 import torch
@@ -6,8 +6,8 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 from torchvision.transforms import ToTensor, Normalize, Resize, Compose
 from transformers import DeiTFeatureExtractor, ViTFeatureExtractor
-from edgepipe.quantization.hook import forward_hook_quant_encode_with_clamp, forward_pre_hook_quant_decode
-from edgepipe.quantization.clamp_op import clamp
+from pipeedge.quantization.hook import forward_hook_quant_encode_with_clamp, forward_pre_hook_quant_decode
+from pipeedge.quantization.clamp_op import clamp
 from runtime import _get_default_quant
 import model_cfg
 
@@ -199,7 +199,7 @@ if __name__ == "__main__":
     parser.add_argument("-pt", "--partition", type=str, default= '1,43,44,48',
                         help="comma-delimited list of start/end layer pairs, e.g.: '1,24,25,48'; "
                              "single-node default: all layers in the model")
-    parser.add_argument("-o", "--output-dir", type=str, default="/home1/haonanwa/projects/EdgePipe/results")
+    parser.add_argument("-o", "--output-dir", type=str, default="/home1/haonanwa/projects/PipeEdge/results")
     parser.add_argument("--clamp", action="store_true", default=False, help="whether do clamp for quantization")
     args = parser.parse_args()
 
