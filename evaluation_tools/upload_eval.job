@@ -13,9 +13,9 @@ module load gcc/8.3.0
 
 #conda init bash
 conda activate EdgePipe
-cd /home1/haonanwa/projects/EdgePipe/
+cd /home1/haonanwa/projects/PipeEdge/
 # test ViT Base
-python3 evaluation.py -b 1 -pt $1 -q $2,$2 --clamp
+python3 evaluation.py -b 1 -pt $1 -q $2,$2 --clamp -o /home1/haonanwa/projects/PipeEdge/test_result
 
 # test ViT Large
 # python3 evaluation.py -b 64 -pt $1 -q $2,$2 -m google/vit-large-patch16-224
