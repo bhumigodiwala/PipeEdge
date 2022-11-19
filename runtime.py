@@ -33,7 +33,7 @@ from pipeedge.comm.p2p import DistP2pContext
 from pipeedge.comm.rpc import DistRpcContext, tensorpipe_rpc_backend_options_factory
 from pipeedge import models
 from pipeedge.quantization.basic_op import tensor_encode_outerdim, tensor_decode_outerdim
-from pipeedge.quantization.clamp_op import clamp_banner2019_gelu, clamp_banner2019_laplace
+from pipeedge.quantization.clamp_op import clamp_banner2019_gelu, clamp_banner2019_laplace, clamp_wang2022_DSACIQ
 from pipeedge.sched.scheduler import sched_pipeline
 import devices
 import model_cfg
@@ -163,7 +163,8 @@ def forward_hook_quant_encode(module, _input_arg, output: Union[torch.Tensor, Tu
     for tensor in output:
         assert isinstance(tensor, torch.Tensor)
         if quant_bit > 0:
-            clamp = clamp_banner2019_laplace if tensor.min() < 0.2 else clamp_banner2019_gelu
+            # clamp = clamp_banner2019_laplace if tensor.min() < 0.2 else clamp_banner2019_gelu
+            clamp = clamp_wang2022_DSACIQ if tensor.min() < 0.2 else clamp_banner2019_gelu
             tensor = clamp(tensor, quant_bit)
         stacked_tensor = tensor_encode_outerdim(tensor, quant_bit)
         comm_tuple += stacked_tensor
