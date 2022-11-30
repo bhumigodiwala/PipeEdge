@@ -68,8 +68,8 @@ def clamp_banner2019_gelu(tensor: torch.Tensor, bit: int) -> torch.Tensor:
     variance = 2* torch.pow(tensor, 2).sum()/torch.numel(tensor)
     dist_parameter = torch.sqrt(0.5*variance)
     optimal_clamp_range = _CLAMP_FACTOR_GELU[bit] * dist_parameter
-    tensor.clamp(-optimal_clamp_range, optimal_clamp_range)
-    return tensor
+    result = tensor.clamp(-optimal_clamp_range, optimal_clamp_range)
+    return result
 
 
 def clamp_banner2019_laplace(tensor: torch.Tensor, bit: int) -> torch.Tensor:
@@ -78,8 +78,8 @@ def clamp_banner2019_laplace(tensor: torch.Tensor, bit: int) -> torch.Tensor:
     variance = torch.var(tensor, unbiased = False)
     dist_parameter = torch.sqrt(0.5*variance)
     optimal_clamp_range = _CLAMP_FACTOR_LAPLACE[bit] * dist_parameter
-    tensor.clamp(-optimal_clamp_range, optimal_clamp_range)
-    return tensor
+    result = tensor.clamp(-optimal_clamp_range, optimal_clamp_range)
+    return result
 
 def clamp_wang2022_DSACIQ(tensor: torch.Tensor, bit: int) -> torch.Tensor:
     """Clamp tensor with directed search method - based on our paper."""
@@ -90,5 +90,5 @@ def clamp_wang2022_DSACIQ(tensor: torch.Tensor, bit: int) -> torch.Tensor:
     fitting_parameter = estimate_laplace(tensor)
     best_parameter = fitting_with_search(norm_hist_x, theo_xaxi, fitting_parameter)
     optimal_clamp_range = _CLAMP_FACTOR_LAPLACE[bit] * best_parameter
-    tensor.clamp(-optimal_clamp_range, optimal_clamp_range)
-    return tensor
+    result = tensor.clamp(-optimal_clamp_range, optimal_clamp_range)
+    return result
