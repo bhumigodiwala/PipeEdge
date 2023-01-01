@@ -1,6 +1,7 @@
 """ Evaluate accuracy on ImageNet dataset of PipeEdge """
 import os
 import argparse
+import time
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -47,7 +48,7 @@ def RML_test(x):
     T = np.log(np.sqrt(alpha)) - np.log(beta) - 0.27421
     return T, (alpha, beta)
 
-def fitting_with_search(norm_hist, theo_xaxi, fitting_parameter, fitting_type = 'laplace', search_range = 0.4, search_steps=100):
+def fitting_with_search(norm_hist, theo_xaxi, fitting_parameter, fitting_type = 'laplace', search_steps=100):
     if fitting_type == 'laplace':
         fitting_curve = Laplace(theo_xaxi, 0.0, fitting_parameter, (theo_xaxi.max()-theo_xaxi.min())/PLOT_BINS)
     else:
@@ -55,7 +56,12 @@ def fitting_with_search(norm_hist, theo_xaxi, fitting_parameter, fitting_type = 
     norm_fitting_curve = normalized(fitting_curve)
     search_direction = -1.0 if norm_hist.max() > norm_fitting_curve.max() else 1.0
 
-    step_len = search_range * fitting_parameter / search_steps
+    # old version: to specify search range by hand
+    # step_len = search_range * fitting_parameter / search_steps
+    # new version: search untill the max of fitting curve reach to the that of real data
+    b_real = 1/(2*norm_hist.max())
+    b_fitting = 1/(2*norm_fitting_curve.max())
+    step_len = np.abs(b_real-b_fitting)*fitting_parameter/(search_steps*b_fitting)
     best_parameter, best_mse = 0.0, 10000.0
     for i in range(search_steps+1):
         temp_parameter = fitting_parameter + i*step_len*search_direction
@@ -77,7 +83,8 @@ def clamp_with_minimalMSE(input, bit, layer_type='normal'):
     theo_xaxi = np.linspace(bins_x.min(), bins_x.max(), PLOT_BINS)
     norm_hist_x = normalized(hist_x)
     rml, (alpha_hat, beta_hat) = RML_test(input_numpy)
-    # near-neighbor search
+    #enforce using of laplace
+    rml = 1
     if rml>0:
         #Laplace
         fitting_type = 'laplace'
@@ -86,9 +93,10 @@ def clamp_with_minimalMSE(input, bit, layer_type='normal'):
         #Gaussain
         fitting_type = 'gaussian'
         fitting_parameter = alpha_hat
-    # best_parameter = fitting_with_search(norm_hist_x, theo_xaxi, fitting_parameter, fitting_type=fitting_type)
-    # optimal_clamp_range = clamp_factor[layer_type][fitting_type][bit] * best_parameter
-    optimal_clamp_range = clamp_factor[layer_type][fitting_type][bit] * fitting_parameter
+    # near-neighbor search
+    best_parameter = fitting_with_search(norm_hist_x, theo_xaxi, fitting_parameter, fitting_type=fitting_type)
+    optimal_clamp_range = clamp_factor[layer_type][fitting_type][bit] * best_parameter
+    # optimal_clamp_range = clamp_factor[layer_type][fitting_type][bit] * fitting_parameter
     optimal_clamp_range = torch.tensor(optimal_clamp_range).float()
 
     # clamp
@@ -184,9 +192,9 @@ def _forward_model(input_tensor, model_shards, stage_layers, is_clamp=True, mode
                         clamp_types = ['normal', 'normal']
                 else:
                     if stage_layers[idx][1] <= half_point:
-                        clamp_types = ['good', 'normal'] # manully selected ['GeLU', 'good']
+                        clamp_types = ['normal', 'normal'] # manully selected ['GeLU', 'good']
                     else:
-                        clamp_types = ['good', 'normal'] # manully selected ['GeLU', 'normal']
+                        clamp_types = ['normal', 'normal'] # manully selected ['GeLU', 'normal']
                 # do clamp
                 temp_tensors_list = []
                 temp_clamp_list = []
@@ -259,15 +267,20 @@ def evaluation(args):
         model_shards.append(_make_shard(model_name, model_file, stage_layers, stage, q_bits))
 
     # run inference
+    start_time = time.time()
     acc_reporter = ReportAccuracy(batch_size, output_dir, model_name, partition, stage_quant[0])
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(val_loader):
+            if batch_idx == 1000:
+                break
             output = _forward_model(input, model_shards, stage_layers, is_clamp)
             _, pred = output.topk(1)
             pred = pred.t()
             acc_reporter.update(pred, target)
             acc_reporter.report()
     print(f"Final Accuracy: {100*acc_reporter.total_acc}; Quant Bitwidth: {stage_quant}")
+    end_time = time.time()
+    print(f"total time = {end_time - start_time}")
 
 
 if __name__ == "__main__":
