@@ -51,9 +51,11 @@ def forward_hook_quant_encode_with_bias_correction(module, _input_arg, output: U
     for tensor in output:
         assert isinstance(tensor, torch.Tensor)
         if quant_bit > 0:
-            clamp = clamp_banner2019_laplace if tensor.min() < -0.2 else clamp_banner2019_gelu
+            clamp = clamp_banner2019_laplace if tensor.min() < - 0.2 else clamp_banner2019_gelu
             tensor = clamp(tensor, quant_bit)
-            tensor = bias_correction(tensor)
+            if tensor.min() < - 0.2:
+                # don't do bias correction after GeLU layers
+                tensor = bias_correction(tensor)
         stacked_tensor = tensor_encode_outerdim(tensor, quant_bit)
         comm_tuple += stacked_tensor
     
