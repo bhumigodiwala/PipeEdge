@@ -12,6 +12,8 @@ from pipeedge import models
 from pipeedge.quantization.clamp_op import clamp_banner2019_gelu, clamp_banner2019_laplace
 from pipeedge.quantization.basic_op import tensor_encode_outerdim, tensor_decode_outerdim
 
+import ipdb
+
 class ReportAccuracy():
     def __init__(self, batch_size, output_dir, model_name, partition, quant) -> None:
         self.current_acc = 0.0
@@ -46,7 +48,7 @@ def forward_hook_quant_encode_with_bias_correction(module, _input_arg, output: U
     if isinstance(output, torch.Tensor):
         output = (output,)
     assert isinstance(output, tuple)
-    quant_bit = module.quant_bit.item()
+    quant_bit = module.quant_bits[1].item()
     comm_tuple = []
     for tensor in output:
         assert isinstance(tensor, torch.Tensor)
@@ -92,11 +94,11 @@ def _get_default_quant(n_stages):
 def _make_shard(model_name, model_file, stage_layers, stage, q_bits):
     shard = model_cfg.module_shard_factory(model_name, model_file, stage_layers[stage][0],
                                             stage_layers[stage][1], stage)
-    shard.register_buffer('quant_bits', torch.tensor(q_bits))
+    shard.register_buffer('quant_bits', q_bits)
     if stage != len(stage_layers)-1:
         shard.register_forward_hook(forward_hook_quant_encode_with_bias_correction)
     if stage != 0:
-        shard.register_forward_hook(forward_pre_hook_quant_decode)
+        shard.register_forward_pre_hook(forward_pre_hook_quant_decode)
     shard.eval()
     return shard
 
@@ -123,10 +125,6 @@ def _forward_model(input_tensor, model_shards, stage_layers, model_name='google/
     for idx in range(num_shards):
         shard = model_shards[idx]
         # forward
-        if isinstance(temp_tensor[0], tuple) and len(temp_tensor[0]) == 2:
-            temp_tensor = temp_tensor[0]
-        elif isinstance(temp_tensor, tuple) and isinstance(temp_tensor[0], torch.Tensor):
-            temp_tensor = temp_tensor[0]
         temp_tensor = shard(temp_tensor)
 
     return temp_tensor
