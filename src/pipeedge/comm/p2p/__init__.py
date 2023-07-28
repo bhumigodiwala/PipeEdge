@@ -7,7 +7,7 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from .. import DistCmdHandler, DistContext
-from .util import DistRequestWaitDaemon
+from . import util
 
 # Base tag values
 TAG_BASE_DATA = 0
@@ -15,10 +15,10 @@ TAG_BASE_CMD = 10
 
 # Offsets which are added to base values above
 TAG_TENSOR_COUNT = 0
-TAG_TENSOR_DTYPE = 1
-TAG_TENSOR_SHAPE_LEN = 2
-TAG_TENSOR_SHAPE = 3
-TAG_TENSOR = 4
+TAG_TENSOR_DTYPE_SHAPELEN = 1
+TAG_TENSOR_SHAPE = 2
+TAG_TENSOR = 3
+TAG_TENSOR_PICKLED_SIZE = 4
 
 # Ordered set of torch types: https://pytorch.org/docs/stable/tensor_attributes.html
 TORCH_TYPES = [ torch.float32,
@@ -39,7 +39,18 @@ for i, t in enumerate(TORCH_TYPES):
 
 
 class DistP2pContext(DistContext):
-    """The singleton distributed P2P context manager."""
+    """
+    The singleton distributed P2P context manager.
+
+    Parameters
+    ----------
+    ipg_args : tuple
+        Arguments for ``torch.distributed.init_process_group()``.
+    ipg_kwargs : dict
+        Keyword arguments for ``torch.distributed.init_process_group()``.
+    cmd_cb : DistCmdHandler
+        Command handler callback.
+    """
 
     def __init__(self, ipg_args: tuple, ipg_kwargs: dict, cmd_cb: DistCmdHandler):
         super().__init__(ipg_args, ipg_kwargs)
@@ -83,29 +94,29 @@ class ConditionQueue(queue.Queue):
 
 
 def _send_tensor(tensor, dst, tag_base, fn_send=dist.send):
-    # NOTE: could optimize by packing dtype and shape length into one message
-    tensor_dtype = torch.tensor(TORCH_TYPES_ENUM[tensor.dtype], dtype=torch.int)
-    tensor_shape_len = torch.tensor(len(tensor.shape), dtype=torch.int)
-    tensor_shape = torch.tensor(tensor.shape, dtype=torch.int)
+    # optimize by packing dtype and shape length into one message
+    shape_len = len(tensor.shape)
+    tensor_dtype_shapelen = torch.tensor([TORCH_TYPES_ENUM[tensor.dtype], shape_len],
+                                         dtype=torch.int)
     results = []
-    results.append(fn_send(tensor=tensor_dtype, dst=dst, tag=tag_base+TAG_TENSOR_DTYPE))
-    results.append(fn_send(tensor=tensor_shape_len, dst=dst, tag=tag_base+TAG_TENSOR_SHAPE_LEN))
-    results.append(fn_send(tensor=tensor_shape, dst=dst, tag=tag_base+TAG_TENSOR_SHAPE))
+    results.append(fn_send(tensor=tensor_dtype_shapelen, dst=dst,
+                   tag=tag_base+TAG_TENSOR_DTYPE_SHAPELEN))
+    if shape_len > 0:
+        tensor_shape = torch.tensor(tensor.shape, dtype=torch.int)
+        results.append(fn_send(tensor=tensor_shape, dst=dst, tag=tag_base+TAG_TENSOR_SHAPE))
     results.append(fn_send(tensor=tensor, dst=dst, tag=tag_base+TAG_TENSOR))
     return results
 
 
 def _recv_tensor(src, tag_base):
-    tensor_dtype = torch.zeros(1, dtype=torch.int)
-    dist.recv(tensor=tensor_dtype, src=src, tag=tag_base+TAG_TENSOR_DTYPE)
-    _tensor_dtype = TORCH_TYPES[int(tensor_dtype)]
-    tensor_shape_len = torch.zeros(1, dtype=torch.int)
-    dist.recv(tensor=tensor_shape_len, src=src, tag=tag_base+TAG_TENSOR_SHAPE_LEN)
-    _tensor_shape_len = int(tensor_shape_len)
-    tensor_shape = torch.zeros(_tensor_shape_len, dtype=torch.int)
-    dist.recv(tensor=tensor_shape, src=src, tag=tag_base+TAG_TENSOR_SHAPE)
-    _tensor_shape = [int(x) for x in tensor_shape] # list(map(lambda x: int(x), tensor_shape))
-    tensor = torch.zeros(_tensor_shape, dtype=_tensor_dtype)
+    tensor_dtype_shapelen = torch.zeros(2, dtype=torch.int)
+    dist.recv(tensor=tensor_dtype_shapelen, src=src, tag=tag_base+TAG_TENSOR_DTYPE_SHAPELEN)
+    dtype = TORCH_TYPES[tensor_dtype_shapelen[0]]
+    shape_len = tensor_dtype_shapelen[1]
+    tensor_shape = torch.zeros(shape_len, dtype=torch.int)
+    if shape_len > 0:
+        dist.recv(tensor=tensor_shape, src=src, tag=tag_base+TAG_TENSOR_SHAPE)
+    tensor = torch.tensor((), dtype=dtype).new_empty(tensor_shape.tolist())
     dist.recv(tensor=tensor, src=src, tag=tag_base+TAG_TENSOR)
     return tensor
 
@@ -164,20 +175,31 @@ class TensorSendThread(AbstractTensorExchangeThread):
                     if self._evt_stop_thread.is_set():
                         return
                     self._queue_out.condition.wait()
-                tensors = self._queue_out.get(block=False)
+                payload = self._queue_out.get(block=False)
                 self._queue_out.condition.notify_all()
-            # tensors come in pairs, except for the last stage results
-            if isinstance(tensors, torch.Tensor):
-                tensors = (tensors,)
-            assert isinstance(tensors, tuple)
-            assert len(tensors) > 0
-            assert isinstance(tensors[0], torch.Tensor)
-            _tensor_count = len(tensors)
-            tensor_count = torch.tensor(_tensor_count, dtype=torch.int)
+            # Avoids pickling tensors if payload is a Tensor or Tuple[Tensor, ...]
+            if isinstance(payload, tuple):
+                objs = payload
+                tensor_count = torch.tensor(len(objs), dtype=torch.int)
+            else:
+                objs = (payload,)
+                tensor_count = torch.tensor(-1, dtype=torch.int)
+            # pickle as needed
+            tensors = ()
+            tensor_sizes = ()
+            for obj in objs:
+                if isinstance(obj, torch.Tensor):
+                    tensor, tensor_size = obj, torch.LongTensor([-1])
+                else:
+                    tensor, tensor_size = util.object_to_tensor(obj, None)
+                tensors += (tensor,)
+                tensor_sizes += (tensor_size,)
             dist.send(tensor=tensor_count, dst=self._dst_rank, tag=TAG_BASE_DATA+TAG_TENSOR_COUNT)
-            # NOTE: could optimize by only sending dtype once (it's the same for all tensors)
+            # pre/post hooks should only wrap tensor send, not any pickling work (above)
             self._call_pre_hooks()
-            for tensor in tensors:
+            for tensor, tensor_size in zip(tensors, tensor_sizes):
+                dist.send(tensor=tensor_size, dst=self._dst_rank,
+                          tag=TAG_BASE_DATA+TAG_TENSOR_PICKLED_SIZE)
                 _send_tensor(tensor, self._dst_rank, TAG_BASE_DATA)
             self._call_post_hooks(tensors)
 
@@ -198,34 +220,41 @@ class TensorRecvThread(AbstractTensorExchangeThread):
     def run(self):
         """Receive tensors and enqueue them."""
         while True:
-            tensor_count = torch.zeros(1, dtype=torch.int)
-            ircv_req = dist.irecv(tensor=tensor_count, src=self._src_rank, tag=TAG_BASE_DATA+TAG_TENSOR_COUNT)
-            ircv_req_t = DistRequestWaitDaemon(ircv_req)
+            tensor_count = torch.tensor(0, dtype=torch.int)
+            ircv_req = dist.irecv(tensor=tensor_count, src=self._src_rank,
+                                  tag=TAG_BASE_DATA+TAG_TENSOR_COUNT)
+            ircv_req_t = util.DistRequestWaitDaemon(ircv_req)
             ircv_req_t.start()
             while ircv_req_t.is_alive():
                 if self._evt_stop_thread.is_set():
                     return
                 # TODO: we're basically spinning...
-                time.sleep(0.1)
-            _tensor_count = int(tensor_count)
-            assert _tensor_count > 0
+                time.sleep(0.001)
             tensors = ()
+            tensor_sizes = ()
+            # pre/post hooks should only wrap tensor recv, not any unpickling work (further below)
             self._call_pre_hooks()
-            for _ in range(_tensor_count):
+            for _ in range(abs(tensor_count)):
+                tensor_size = torch.LongTensor([-1])
+                dist.recv(tensor=tensor_size, src=self._src_rank,
+                          tag=TAG_BASE_DATA+TAG_TENSOR_PICKLED_SIZE)
                 tensor = _recv_tensor(self._src_rank, TAG_BASE_DATA)
+                tensor_sizes += (tensor_size,)
                 tensors += (tensor,)
             self._call_post_hooks(tensors)
-            if _tensor_count == 1:
-                # At this point, we don't know whether the original data type was a Tensor or Tuple[Tensor] w/ len=1.
-                # We'd have to include that information in a separate message to know for sure.
-                # For now, it works to reduce to the base case - just a single Tensor.
-                tensors = tensors[0]
+            # unpickle as needed
+            objs = ()
+            for tensor, tensor_size in zip(tensors, tensor_sizes):
+                obj = tensor if tensor_size < 0 else util.tensor_to_object(tensor, tensor_size)
+                objs += (obj,)
+            # if tensor_count >= 0, then the original payload was a tuple
+            payload = objs if tensor_count >= 0 else objs[0]
             # Blocks if queue is full, which then blocks receiving more tensors (as intended)
             # Worker thread must be running to avoid indefinite blocking
             with self._queue_in.condition:
                 while self._queue_in.full():
                     self._queue_in.condition.wait()
-                self._queue_in.put(tensors)
+                self._queue_in.put(payload)
                 self._queue_in.condition.notify_all()
 
 
@@ -284,7 +313,7 @@ class CommandThread(threading.Thread):
             # contains (1) CMD enumeration and (2) an optional tensor count
             tensor_cmd = torch.zeros(2, dtype=torch.int)
             ircv_req = dist.irecv(tensor=tensor_cmd, tag=TAG_BASE_CMD)
-            ircv_req_t = DistRequestWaitDaemon(ircv_req)
+            ircv_req_t = util.DistRequestWaitDaemon(ircv_req)
             ircv_req_t.start()
             while ircv_req_t.is_alive():
                 if self._evt_stop_thread.is_set():
@@ -303,45 +332,66 @@ class CommandThread(threading.Thread):
 
 
 class DistP2pPipelineStage:
-    """The singleton distributed P2P pipeline stage context manager."""
+    """
+    The singleton distributed P2P pipeline stage context manager.
 
-    def __init__(self, stage_ranks: List[int], stage: int, work_cb: Callable,
-                 results_cb: Callable[[Any], None]):
-        self._stage = stage
+    Creates receiver, sender, worker, and results processing threads when their respective
+    optional parameters are specified.
+    Threads communicate with each other through data queues, where the exact configuration depends
+    on which threads are requested.
+    Parameters must be specified appropriately on each rank to form a functionally correct pipeline.
+
+    Because there is (at most) one receiver thread, only one rank may specify `results_cb` and
+    that rank must not have a `work_cb` (be a stage) in the middle of the work pipeline.
+    If it's the first work stage, that rank must also be the data source feeding `enqueue_tensor`
+    (i.e., not receive inputs from a rank outside the work pipeline).
+    If it's the last work stage, then `rank_dst` must be `None`, otherwise the results processing
+    thread and sender thread would race for the data produced by the work thread.
+    Otherwise, the rank specifying `results_cb` must not be in the work pipeline.
+
+    Ranks that do nothing may specify `None` for all parameters.
+
+    Parameters
+    ----------
+    rank_src : Optional[int]
+        The rank to receive tensors from.
+    rank_dst : Optional[int]
+        The rank to send tensors to.
+    work_cb : Optional[Callable]
+        The worker callback - if None, received tensors are sent without modification.
+    results_cb : Optional[Callable]
+        The results callback.
+    """
+
+    def __init__(self, rank_src: Optional[int], rank_dst: Optional[int],
+                 work_cb: Optional[Callable], results_cb: Optional[Callable[[Any], None]]):
         self._initialized = False
         self._queues = {}
         self._threads = {}
-        if self._stage is not None:
-            self._create_stage(stage_ranks, work_cb, results_cb)
+        self._create_stage(rank_src, rank_dst, work_cb, results_cb)
 
-    def _create_stage(self, stage_ranks, work_cb, results_cb):
-        # stage 0 feeds `in` queue using `enqueue_batch()`; last stage sends results to stage 0
-        # inputs are already loaded in memory, so no need to limit in-queue size on stage 0
-        if self._stage == 0:
-            self._queues['in'] = ConditionQueue(maxsize=0)
-            # results thread must use a different queue than feeds the first model shard
-            self._queues['res'] = ConditionQueue(maxsize=1)
-            self._threads['res'] = TensorWorkThread(self._queues['res'], None, results_cb)
+    def _create_stage(self, rank_src, rank_dst, work_cb, results_cb):
+        self._queues['in'] = ConditionQueue(maxsize=1)
+        self._queues['out'] = ConditionQueue(maxsize=1)
+        self._queues['res'] = ConditionQueue(maxsize=1)
+
+        if work_cb is None:
+            # Short-circuit from the inbound queue (can relay data without a worker thread)
+            self._queues['out'] = self._queues['in']
         else:
-            self._queues['in'] = ConditionQueue(maxsize=1)
+            self._threads['work'] = TensorWorkThread(self._queues['in'], self._queues['out'],
+                                                     work_cb)
 
-        if len(stage_ranks) > 1:
-            rank_src = stage_ranks[(self._stage - 1)]
-            rank_dst = stage_ranks[(self._stage + 1) % len(stage_ranks)]
-            # create send/receive/command threads
-            self._queues['out'] = ConditionQueue(maxsize=1)
+        if results_cb is not None:
+            queue_res = self._queues['out'] if rank_dst is None else self._queues['res']
+            self._threads['res'] = TensorWorkThread(queue_res, None, results_cb)
+
+        if rank_dst is not None:
             self._threads['send'] = TensorSendThread(self._queues['out'], rank_dst)
-            if self._stage == 0:
-                # stage 0's receiver thread gets results, so feeds a different queue
-                self._threads['recv'] = TensorRecvThread(self._queues['res'], rank_src)
-            else:
-                self._threads['recv'] = TensorRecvThread(self._queues['in'], rank_src)
-        else:
-            # degenerate case: no send/receive/command threads; the out queue is the results queue
-            self._queues['out'] = self._queues['res']
 
-        # all stages do work
-        self._threads['work'] = TensorWorkThread(self._queues['in'], self._queues['out'], work_cb)
+        if rank_src is not None:
+            queue_in = self._queues['in'] if results_cb is None else self._queues['res']
+            self._threads['recv'] = TensorRecvThread(queue_in, rank_src)
 
     def init(self) -> None:
         """Initialize the distributed context and threads."""
@@ -389,14 +439,12 @@ class DistP2pPipelineStage:
     def __exit__(self, *args):
         self.shutdown()
 
-    def enqueue_batch(self, inputs: torch.Tensor, split_size: int) -> None:
-        """Insert data into the front of the pipeline."""
-        assert self._stage == 0
+    def enqueue_tensor(self, tensor: torch.Tensor) -> None:
+        """Insert data into the pipeline."""
         assert self._initialized
-        for input_chunk in iter(inputs.split(split_size, dim=0)):
-            queue_in = self._queues['in']
-            with queue_in.condition:
-                while queue_in.full():
-                    queue_in.condition.wait()
-                queue_in.put(input_chunk)
-                queue_in.condition.notify_all()
+        queue_in = self._queues['in']
+        with queue_in.condition:
+            while queue_in.full():
+                queue_in.condition.wait()
+            queue_in.put(tensor)
+            queue_in.condition.notify_all()

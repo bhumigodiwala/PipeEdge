@@ -1,265 +1,219 @@
 """BERT transformers."""
+from collections.abc import Mapping
 import logging
 import math
-import time
+from typing import Union
 import numpy as np
 import torch
 from torch import nn
-from transformers.models.bert.modeling_bert import BertEmbeddings, BertPooler, BertSelfAttention, BertSelfOutput, BertIntermediate, BertOutput, BertLayer
-from . import TransformerShard, TransformerShardData
+from transformers import BertConfig, BertForSequenceClassification, BertModel
+from transformers.models.bert.modeling_bert import (
+    BertEmbeddings, BertIntermediate, BertOutput, BertPooler, BertSelfAttention, BertSelfOutput
+)
+from .. import ModuleShard, ModuleShardConfig
+from . import TransformerShardData
 
 
 logger = logging.getLogger(__name__)
 
 
-def _forward_kernel(layer, x, skip, kernel_id):
-    if kernel_id == 1:
-        x = layer[0](x)[0]
-    elif kernel_id == 2:
-        x = layer[0](x, skip)
-        skip = x
-    elif kernel_id == 3:
-        x = layer[0](x)
-    else:
-        x = layer[0](x, skip)
-        skip = x
-    return x, skip
+class BertLayerShard(ModuleShard):
+    """Module shard based on `BertLayer`."""
+
+    def __init__(self, config: BertConfig, shard_config: ModuleShardConfig):
+        super().__init__(config, shard_config)
+        self.self_attention = None
+        self.self_output = None
+        self.intermediate = None
+        self.output = None
+        self._build_shard()
+
+    def _build_shard(self):
+        if self.has_layer(0):
+            self.self_attention = BertSelfAttention(self.config)
+        if self.has_layer(1):
+            self.self_output = BertSelfOutput(self.config)
+        if self.has_layer(2):
+            self.intermediate = BertIntermediate(self.config)
+        if self.has_layer(3):
+            self.output = BertOutput(self.config)
+
+    @torch.no_grad()
+    def forward(self, data: TransformerShardData) -> TransformerShardData:
+        """Compute layer shard."""
+        if self.has_layer(0):
+            data = (self.self_attention(data)[0], data)
+        if self.has_layer(1):
+            data = self.self_output(data[0], data[1])
+        if self.has_layer(2):
+            data = (self.intermediate(data), data)
+        if self.has_layer(3):
+            data = self.output(data[0], data[1])
+        return data
 
 
-class BertTransformerShard(TransformerShard):
-    """BERT transformer shard."""
+class BertModelShard(ModuleShard):
+    """Module shard based on `BertModel`."""
 
-    def __init__(self, stage: int, model_name: str, model_file: str, is_first: bool, is_last: bool,
-                 start_layer: int, end_layer: int, load_weight: bool=True):
-        super().__init__(stage, model_name, model_file, is_first, is_last, start_layer, end_layer,
-                         load_weight)
+    def __init__(self, config: BertConfig, shard_config: ModuleShardConfig,
+                 model_weights: Union[str, Mapping]):
+        super().__init__(config, shard_config)
         self.embeddings = None
+        # BertModel uses an encoder here, but we'll just add the layers here instead.
+        # Since we just do inference, a BertEncoderShard class wouldn't provide real benefit.
+        self.layers = nn.ModuleList()
+        self.pooler = None
 
-        logger.debug(">>>> Model name: %s", model_name)
-        if self.load_weight:
-            logger.debug(">>>> Load weight file: %s", self.weights_file_name)
-            with np.load(self.weights_file_name) as weights:
-                self._make_layer(weights)
+        logger.debug(">>>> Model name: %s", self.config.name_or_path)
+        if isinstance(model_weights, str):
+            logger.debug(">>>> Load weight file: %s", model_weights)
+            with np.load(model_weights) as weights:
+                self._build_shard(weights)
         else:
-            self._make_layer(None)
+            self._build_shard(model_weights)
 
-        logger.info("======= Finish Build BertTransformerShard%d ==========", self.stage)
-
-    def _make_layer(self, weights):
-        ## first Shard
-        if self.is_first:
+    def _build_shard(self, weights):
+        if self.shard_config.is_first:
+            logger.debug(">>>> Load embeddings layer for the first shard")
             self.embeddings = BertEmbeddings(self.config)
             self.embeddings.eval()
-            logger.debug(">>>> Load embeddings layer for the first shard")
-            if self.load_weight:
-                self._load_layer_weights(weights, 0, None, load_first = True, load_last=False, load_kernel = False, kernel_id=None)
-                logger.debug(">>>> Load weights for embeddings layer")
+            self._load_weights_first(weights)
 
-        current_layer_idx = self.start_layer
+        layer_curr = self.shard_config.layer_start
+        while layer_curr <= self.shard_config.layer_end:
+            layer_id = math.ceil(layer_curr / 4) - 1
+            sublayer_start = (layer_curr - 1) % 4
+            if layer_id == math.ceil(self.shard_config.layer_end / 4) - 1:
+                sublayer_end = (self.shard_config.layer_end - 1) % 4
+            else:
+                sublayer_end = 3
+            logger.debug(">>>> Load layer %d, sublayers %d-%d",
+                         layer_id, sublayer_start, sublayer_end)
+            layer_config = ModuleShardConfig(layer_start=sublayer_start, layer_end=sublayer_end)
+            layer = BertLayerShard(self.config, layer_config)
+            self._load_weights_layer(weights, layer_id, layer)
+            self.layers.append(layer)
+            layer_curr += sublayer_end - sublayer_start + 1
 
-        ## first ununit part
-        if self.start_layer %4 != 1 or (self.start_layer+3 > self.end_layer):
-            logger.debug(">>>> For the first model part, load weight is %s:", self.load_weight)
-            for i in range(self.start_layer, min(self.end_layer, math.ceil(self.start_layer/4)*4)+1):
-                logger.debug("    Load the %d-th operation (%s) for %d-th vit layer",
-                              i%4, self.operators_list[(i-1)%4], math.ceil(i/4)-1)
-                layer = self._build_kernel(weights, i%4, math.ceil(i/4)-1, self.load_weight)
-                layer.eval()
-                self.first_ops.append(layer)
-            current_layer_idx = min(self.end_layer+1, math.ceil(self.start_layer/4)*4+1)
+        if self.shard_config.is_last:
+            logger.debug(">>>> Load pooler for the last shard")
+            self.pooler = BertPooler(self.config)
+            self.pooler.eval()
+            self._load_weights_last(weights)
 
-        ## mid unit part, the whole vit_layer
-        while current_layer_idx + 3 <= self.end_layer:
-            with torch.no_grad():
-                layer = BertLayer(self.config)
-            if self.load_weight:
-                layer = self._load_layer_weights(weights, math.ceil(current_layer_idx/4)-1, layer)
-            layer.eval()
-            self.vit_layers.append(layer)
-            logger.debug(">>>> Load the %d-th %s Layer, load weight is %s",
-                          math.ceil(current_layer_idx/4)-1, self.model_name, self.load_weight)
-            current_layer_idx += 4
+    @torch.no_grad()
+    def _load_weights_first(self, weights):
+        self.embeddings.position_ids.copy_(torch.from_numpy((weights["embeddings.position_ids"])))
+        self.embeddings.word_embeddings.weight.copy_(torch.from_numpy(weights['embeddings.word_embeddings.weight']))
+        self.embeddings.position_embeddings.weight.copy_(torch.from_numpy(weights['embeddings.position_embeddings.weight']))
+        self.embeddings.token_type_embeddings.weight.copy_(torch.from_numpy(weights['embeddings.token_type_embeddings.weight']))
+        self.embeddings.LayerNorm.weight.copy_(torch.from_numpy(weights['embeddings.LayerNorm.weight']))
+        self.embeddings.LayerNorm.bias.copy_(torch.from_numpy(weights['embeddings.LayerNorm.bias']))
 
-        ## last unit part
-        if self.end_layer >= current_layer_idx:
-            logger.debug(">>>> For the last model part, load weight is %s:", self.load_weight)
-        for i in range(current_layer_idx, self.end_layer+1):
-            logger.debug("    Load the %d-th operation (%s) for %d-th vit layer",
-                          i%4, self.operators_list[(i-1)%4], math.ceil(i/4)-1)
-            layer = self._build_kernel(weights, i%4, math.ceil(i/4)-1, self.load_weight)
-            if self.load_weight:
-                layer = self._load_layer_weights(weights, math.ceil(i/4)-1, layer, False, False, True, i%4)
-            layer.eval()
-            self.last_ops.append(layer)
+    @torch.no_grad()
+    def _load_weights_last(self, weights):
+        self.pooler.dense.weight.copy_(torch.from_numpy(weights["pooler.dense.weight"]))
+        self.pooler.dense.bias.copy_(torch.from_numpy(weights['pooler.dense.bias']))
 
-        ## last Shard
-        if self.is_last:
-            self.bertpooler = BertPooler(self.config)
-            self.bertpooler.eval()
-            if self.load_weight:
-                self._load_layer_weights(weights, 0, None, load_first = False, load_last=True, load_kernel = False, kernel_id=None)
-                logger.debug(">>>> Load weights for layernorm and last shard")
-
-
-        if self.load_weight:
-            logger.debug(">>>> Finish load weights")
-        else:
-            logger.debug(">>>> Do NOT load weights")
-
-    def _build_kernel(self, weights, kernel_id, vit_layer_id, load_weight=True):
-        layers = nn.ModuleList()
-        if kernel_id == 1:
-            layers.append(BertSelfAttention(self.config))
-        elif kernel_id == 2:
-            layers.append(BertSelfOutput(self.config))
-        elif kernel_id == 3:
-            layers.append(BertIntermediate(self.config))
-        else:
-            layers.append(BertOutput(self.config))
-        if load_weight:
-            self._load_layer_weights(weights, vit_layer_id, layers, False, False, load_weight, kernel_id)
-        return layers
-
-    def _load_layer_weights(self, weights, id, transformer_layer, load_first = False, load_last=False, load_kernel = False, kernel_id=None):
-        ROOT = f"encoder.layer.{id}."
-        ATTENTION_Q = "attention.self.query."
-        ATTENTION_K = "attention.self.key."
-        ATTENTION_V = "attention.self.value."
-        ATTENTION_OUT_DENSE = "attention.output.dense."
-        ATTENTION_OUT_LAYERNORM = "attention.output.LayerNorm."
-        INTERMEDIATE = "intermediate.dense."
-        OUTPUT_DENSE = "output.dense."
-        OUTPUT_LAYER = "output.LayerNorm."
-        WEIGHT = "weight"
-        BIAS = "bias"
-        if load_first:
-            with torch.no_grad():
-                self.embeddings.position_ids.copy_(torch.from_numpy((weights["embeddings.position_ids"])))
-                self.embeddings.word_embeddings.weight.copy_(torch.from_numpy(weights['embeddings.word_embeddings.weight']))
-                self.embeddings.position_embeddings.weight.copy_(torch.from_numpy(weights['embeddings.position_embeddings.weight']))
-                self.embeddings.token_type_embeddings.weight.copy_(torch.from_numpy(weights['embeddings.token_type_embeddings.weight']))
-                self.embeddings.LayerNorm.weight.copy_(torch.from_numpy(weights['embeddings.LayerNorm.weight']))
-                self.embeddings.LayerNorm.bias.copy_(torch.from_numpy(weights['embeddings.LayerNorm.bias']))
-
-        if load_last:
-            with torch.no_grad():
-                self.bertpooler.dense.weight.copy_(torch.from_numpy(weights["pooler.dense.weight"]))
-                self.bertpooler.dense.bias.copy_(torch.from_numpy(weights['pooler.dense.bias']))
-
-
-        if not load_first and not load_last:
-            with torch.no_grad():
-                if not load_kernel:
-                    query_weight = torch.from_numpy(weights[ROOT + ATTENTION_Q + WEIGHT])
-                    key_weight = torch.from_numpy(weights[ROOT + ATTENTION_K + WEIGHT])
-                    value_weight = torch.from_numpy(weights[ROOT + ATTENTION_V + WEIGHT])
-                    out_dense_weight = torch.from_numpy(weights[ROOT + ATTENTION_OUT_DENSE + WEIGHT])
-                    output_layernorm_weight = torch.from_numpy(weights[ROOT + ATTENTION_OUT_LAYERNORM + WEIGHT])
-                    intermediate_dense_weight = torch.from_numpy(weights[ROOT+INTERMEDIATE+WEIGHT])
-                    dense_weight = torch.from_numpy(weights[ROOT + OUTPUT_DENSE + WEIGHT])
-                    layernorm_weight = torch.from_numpy(weights[ROOT + OUTPUT_LAYER + WEIGHT])
-
-                    query_bias = torch.from_numpy(weights[ROOT + ATTENTION_Q + BIAS])
-                    key_bias = torch.from_numpy(weights[ROOT + ATTENTION_K + BIAS])
-                    value_bias = torch.from_numpy(weights[ROOT + ATTENTION_V + BIAS])
-                    out_dense_bias = torch.from_numpy(weights[ROOT + ATTENTION_OUT_DENSE + BIAS])
-                    output_layernorm_bias = torch.from_numpy(weights[ROOT + ATTENTION_OUT_LAYERNORM + BIAS])
-                    intermediate_dense_bias = torch.from_numpy(weights[ROOT+INTERMEDIATE+BIAS])
-                    dense_bias = torch.from_numpy(weights[ROOT + OUTPUT_DENSE + BIAS])
-                    layernorm_bias = torch.from_numpy(weights[ROOT + OUTPUT_LAYER + BIAS])
-
-                    transformer_layer.attention.self.query.weight.copy_(query_weight)
-                    transformer_layer.attention.self.key.weight.copy_(key_weight)
-                    transformer_layer.attention.self.value.weight.copy_(value_weight)
-                    transformer_layer.attention.output.dense.weight.copy_(out_dense_weight)
-                    transformer_layer.attention.output.LayerNorm.weight.copy_(output_layernorm_weight)
-
-                    transformer_layer.attention.self.query.bias.copy_(query_bias)
-                    transformer_layer.attention.self.key.bias.copy_(key_bias)
-                    transformer_layer.attention.self.value.bias.copy_(value_bias)
-                    transformer_layer.attention.output.dense.bias.copy_(out_dense_bias)
-                    transformer_layer.attention.output.LayerNorm.bias.copy_(output_layernorm_bias)
-
-                    transformer_layer.intermediate.dense.weight.copy_(intermediate_dense_weight)
-                    transformer_layer.intermediate.dense.bias.copy_(intermediate_dense_bias )
-
-                    transformer_layer.output.dense.weight.copy_(dense_weight)
-                    transformer_layer.output.dense.bias.copy_(dense_bias)
-                    transformer_layer.output.LayerNorm.weight.copy_(layernorm_weight)
-                    transformer_layer.output.LayerNorm.bias.copy_(layernorm_bias)
-                    logger.debug("memory %d MB", self.process.memory_info().rss // 1000000)
-
-                elif kernel_id == 1:
-
-                    query_weight = torch.from_numpy(weights[ROOT + ATTENTION_Q + WEIGHT])
-                    key_weight = torch.from_numpy(weights[ROOT + ATTENTION_K + WEIGHT])
-                    value_weight = torch.from_numpy(weights[ROOT + ATTENTION_V + WEIGHT])
-                    query_bias = torch.from_numpy(weights[ROOT + ATTENTION_Q + BIAS])
-                    key_bias = torch.from_numpy(weights[ROOT + ATTENTION_K + BIAS])
-                    value_bias = torch.from_numpy(weights[ROOT + ATTENTION_V + BIAS])
-                    transformer_layer[0].query.weight.copy_(query_weight)
-                    transformer_layer[0].key.weight.copy_(key_weight)
-                    transformer_layer[0].value.weight.copy_(value_weight)
-                    transformer_layer[0].query.bias.copy_(query_bias)
-                    transformer_layer[0].key.bias.copy_(key_bias)
-                    transformer_layer[0].value.bias.copy_(value_bias)
-
-                elif kernel_id == 2:
-                    out_dense_weight = torch.from_numpy(weights[ROOT + ATTENTION_OUT_DENSE + WEIGHT])
-                    output_layernorm_weight = torch.from_numpy(weights[ROOT + ATTENTION_OUT_LAYERNORM + WEIGHT])
-                    out_dense_bias = torch.from_numpy(weights[ROOT + ATTENTION_OUT_DENSE + BIAS])
-                    output_layernorm_bias = torch.from_numpy(weights[ROOT + ATTENTION_OUT_LAYERNORM + BIAS])
-                    transformer_layer[0].dense.weight.copy_(out_dense_weight)
-                    transformer_layer[0].LayerNorm.weight.copy_(output_layernorm_weight)
-                    transformer_layer[0].dense.bias.copy_(out_dense_bias)
-                    transformer_layer[0].LayerNorm.bias.copy_(output_layernorm_bias)
-                elif kernel_id == 3:
-                    intermediate_dense_weight = torch.from_numpy(weights[ROOT+INTERMEDIATE+WEIGHT])
-                    intermediate_dense_bias = torch.from_numpy(weights[ROOT+INTERMEDIATE+BIAS])
-                    transformer_layer[0].dense.weight.copy_(intermediate_dense_weight)
-                    transformer_layer[0].dense.bias.copy_(intermediate_dense_bias )
-                elif kernel_id == 0:
-                    dense_weight = torch.from_numpy(weights[ROOT + OUTPUT_DENSE + WEIGHT])
-                    layernorm_weight = torch.from_numpy(weights[ROOT + OUTPUT_LAYER + WEIGHT])
-                    dense_bias = torch.from_numpy(weights[ROOT + OUTPUT_DENSE + BIAS])
-                    layernorm_bias = torch.from_numpy(weights[ROOT + OUTPUT_LAYER + BIAS])
-
-                    transformer_layer[0].dense.weight.copy_(dense_weight)
-                    transformer_layer[0].dense.bias.copy_(dense_bias)
-                    transformer_layer[0].LayerNorm.weight.copy_(layernorm_weight)
-                    transformer_layer[0].LayerNorm.bias.copy_(layernorm_bias)
-
-        return transformer_layer
+    @torch.no_grad()
+    def _load_weights_layer(self, weights, layer_id, layer):
+        root = f"encoder.layer.{layer_id}."
+        if layer.has_layer(0):
+            layer.self_attention.query.weight.copy_(torch.from_numpy(weights[root + "attention.self.query.weight"]))
+            layer.self_attention.key.weight.copy_(torch.from_numpy(weights[root + "attention.self.key.weight"]))
+            layer.self_attention.value.weight.copy_(torch.from_numpy(weights[root + "attention.self.value.weight"]))
+            layer.self_attention.query.bias.copy_(torch.from_numpy(weights[root + "attention.self.query.bias"]))
+            layer.self_attention.key.bias.copy_(torch.from_numpy(weights[root + "attention.self.key.bias"]))
+            layer.self_attention.value.bias.copy_(torch.from_numpy(weights[root + "attention.self.value.bias"]))
+        if layer.has_layer(1):
+            layer.self_output.dense.weight.copy_(torch.from_numpy(weights[root + "attention.output.dense.weight"]))
+            layer.self_output.LayerNorm.weight.copy_(torch.from_numpy(weights[root + "attention.output.LayerNorm.weight"]))
+            layer.self_output.dense.bias.copy_(torch.from_numpy(weights[root + "attention.output.dense.bias"]))
+            layer.self_output.LayerNorm.bias.copy_(torch.from_numpy(weights[root + "attention.output.LayerNorm.bias"]))
+        if layer.has_layer(2):
+            layer.intermediate.dense.weight.copy_(torch.from_numpy(weights[root + "intermediate.dense.weight"]))
+            layer.intermediate.dense.bias.copy_(torch.from_numpy(weights[root + "intermediate.dense.bias"]))
+        if layer.has_layer(3):
+            layer.output.dense.weight.copy_(torch.from_numpy(weights[root + "output.dense.weight"]))
+            layer.output.dense.bias.copy_(torch.from_numpy(weights[root + "output.dense.bias"]))
+            layer.output.LayerNorm.weight.copy_(torch.from_numpy(weights[root + "output.LayerNorm.weight"]))
+            layer.output.LayerNorm.bias.copy_(torch.from_numpy(weights[root + "output.LayerNorm.bias"]))
 
     @torch.no_grad()
     def forward(self, data: TransformerShardData) -> TransformerShardData:
         """Compute shard layers."""
-        start = time.time()
-        x, skip = TransformerShard.parse_forward_data(data)
+        if self.shard_config.is_first:
+            data = self.embeddings(data)
+        for layer in self.layers:
+            data = layer(data)
+        if self.shard_config.is_last:
+            data = self.pooler(data)
+        return data
 
-        if self.is_first:
-            x = self.embeddings(x)
-            skip = x
+    @staticmethod
+    def save_weights(model_name: str, model_file: str) -> None:
+        """Save the model weights file."""
+        model = BertModel.from_pretrained(model_name)
+        state_dict = model.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        np.savez(model_file, **weights)
 
-        for i, op in enumerate(self.first_ops):
-            x, skip = _forward_kernel(op, x, skip, (self.start_layer+i)%4)
 
-        for layer in self.vit_layers:
-            with torch.no_grad():
-                x = layer(x)[0]
-                skip = x
+class BertShardForSequenceClassification(ModuleShard):
+    """Module shard based on `BertForSequenceClassification`."""
 
-        for i, op in enumerate(self.last_ops):
-            # could drop modulus since 0<=i<4, but making 0<=kernel_id<4 is at least consistent with _load_layer_weights()
-            x, skip = _forward_kernel(op, x, skip, (i+1)%4)
+    def __init__(self, config: BertConfig, shard_config: ModuleShardConfig,
+                 model_weights: Union[str, Mapping]):
+        super().__init__(config, shard_config)
+        self.bert = None
+        self.classifier = None
 
-        if self.is_last:
-            x = self.bertpooler(x)
-        end = time.time()
+        logger.debug(">>>> Model name: %s", self.config.name_or_path)
+        if isinstance(model_weights, str):
+            logger.debug(">>>> Load weight file: %s", model_weights)
+            with np.load(model_weights) as weights:
+                self._build_shard(weights)
+        else:
+            self._build_shard(model_weights)
 
-        logger.info("Shard%d: computed microbatch in: %f sec", self.stage, end - start)
-        logger.info("Shard%d: memory: %d MB", self.stage, self.process.memory_info().rss / 1000000)
+    def _build_shard(self, weights):
+        ## all shards use the inner BERT model
+        self.bert = BertModelShard(self.config, self.shard_config,
+                                   self._extract_weights_bert(weights))
 
-        if self.end_layer % 2 == 0:
-            return x
-        return x, skip
+        if self.shard_config.is_last:
+            logger.debug(">>>> Load classifier for the last shard")
+            self.classifier = nn.Linear(self.config.hidden_size, self.config.num_labels)
+            self._load_weights_last(weights)
+
+    def _extract_weights_bert(self, weights):
+        bert_weights = {}
+        for key, val in weights.items():
+            if key.startswith('bert.'):
+                bert_weights[key[len('bert.'):]] = val
+        return bert_weights
+
+    @torch.no_grad()
+    def _load_weights_last(self, weights):
+        self.classifier.weight.copy_(torch.from_numpy(weights['classifier.weight']))
+        self.classifier.bias.copy_(torch.from_numpy(weights['classifier.bias']))
+
+    @torch.no_grad()
+    def forward(self, data: TransformerShardData) -> TransformerShardData:
+        """Compute shard layers."""
+        data = self.bert(data)
+        if self.shard_config.is_last:
+            data = self.classifier(data)
+        return data
+
+    @staticmethod
+    def save_weights(model_name: str, model_file: str) -> None:
+        """Save the model weights file."""
+        model = BertForSequenceClassification.from_pretrained(model_name)
+        state_dict = model.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        np.savez(model_file, **weights)

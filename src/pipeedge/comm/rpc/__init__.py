@@ -128,10 +128,13 @@ class DistRpcPipeline:
         self._rref_list = stage_rrefs
         self._link_pipeline(results_to, results_cb)
 
-    def rpc_register_buffer(self, name: str, tensors: List[Optional[torch.Tensor]]) -> None:
+    def rpc_register_buffer(self, name: str, tensors: List[Optional[torch.Tensor]],
+                            **kwargs: dict) -> None:
         """Add buffers to RPC modules."""
-        assert len(tensors) == len(self._rref_list)
-        futs = [rref.rpc_async().mod_register_buffer(name, tensor)
+        if len(tensors) != len(self._rref_list):
+            raise ValueError(f"tensors length ({len(tensors)}) doesn't match pipeline length "
+                             f"({len(self._rref_list)})")
+        futs = [rref.rpc_async().mod_register_buffer(name, tensor, **kwargs)
                 for rref, tensor in zip(self._rref_list, tensors)]
         torch.futures.wait_all(futs)
 
@@ -154,8 +157,7 @@ class DistRpcPipeline:
         futs.append(self._rref_list[-1].rpc_async().set_results(results_to, results_cb))
         torch.futures.wait_all(futs)
 
-    def enqueue_batch(self, inputs: torch.Tensor, split_size: int) -> None:
+    def enqueue_tensor(self, tensor: torch.Tensor) -> None:
         """Insert data into the front of the pipeline."""
-        for ubatch in iter(inputs.split(split_size, dim=0)):
-            self._rref_list[0].rpc_sync().wait_for_ready()
-            self._rref_list[0].rpc_async().__call__(ubatch)
+        self._rref_list[0].rpc_sync().wait_for_ready()
+        self._rref_list[0].rpc_async().__call__(tensor)

@@ -44,26 +44,17 @@ python3 -m venv .venv
 . .venv/bin/activate
 ```
 
-Install the development package, Python package dependencies, and tools dependencies with:
+Install the development package, Python package dependencies, and runtime application dependencies with:
 
 ```sh
 pip install -U pip
-pip install -e .[tools]
+pip install -e '.[runtime]'
 ```
 
-Download ViT weight files from [Google Cloud](https://console.cloud.google.com/storage/browser/vit_models;tab=objects?pageState=(%22StorageObjectListTable%22:(%22f%22:%22%255B%255D%22))&prefix=&forceOnObjectsSortingFiltering=false), e.g.:
+Download model weight files (ViT files are from [Google Cloud](https://console.cloud.google.com/storage/browser/vit_models)):
 
 ```sh
-wget https://storage.googleapis.com/vit_models/imagenet21k%2Bimagenet2012/ViT-B_16-224.npz
-wget https://storage.googleapis.com/vit_models/imagenet21k%2Bimagenet2012/ViT-L_16-224.npz
-wget https://storage.googleapis.com/vit_models/imagenet21k/ViT-H_14.npz
-```
-
-Download BERT and DeiT weight files, too:
-
-```sh
-python tools/bert_save_weights.py
-python tools/deit_save_weights.py
+python save_model_weights.py
 ```
 
 ### Optional dependencies:
@@ -129,3 +120,50 @@ Point `runtime.py` to the YAML files using the options `-sm/--sched-models-file`
 The runtime passes these through to the previously compiled scheduler application, along with other configurations like the model name and microbatch size.
 Then map the hosts specified in the third YAML file to the distributed ranks in your runtime using the `-H/--hosts` option.
 Do not specify the `-pt/--partition` option, which is for manually specifying the schedule and takes precedence over automated scheduling.
+
+
+## Datasets
+
+### GLUE CoLA
+
+Supported by the following models:
+
+* textattack/bert-base-uncased-CoLA
+
+The dataset will be automatically downloaded from [huggingface.co](https://huggingface.co/datasets/glue).
+
+Use in `runtime.py` with the option(s): `--dataset-name=CoLA`
+
+### ImageNet
+
+Supported by the following models:
+
+* google/vit-base-patch16-224
+* google/vit-large-patch16-224
+* facebook/deit-base-distilled-patch16-224
+* facebook/deit-small-distilled-patch16-224
+* facebook/deit-tiny-distilled-patch16-224
+
+This dataset cannot be downloaded automatically because a login is required to access the files.
+Register with [image-net.org](https://www.image-net.org/), then [download](https://image-net.org/challenges/LSVRC/2012/2012-downloads.php) `ILSVRC2012_devkit_t12.tar.gz` and at least one of `ILSVRC2012_img_train.tar` and `ILSVRC2012_img_val.tar`.
+Place the files in their own directory.
+The archives will be automatically parsed and extracted into a usable folder structure within the same directory.
+
+Use in `runtime.py` with the option(s): `--dataset-name=ImageNet --dataset-root=/path/to/archive_dir`
+
+
+## Citation
+
+If using this software for scientific research or publications, please cite as:
+
+Yang Hu, Connor Imes, Xuanang Zhao, Souvik Kundu, Peter A. Beerel, Stephen P. Crago, John Paul Walters, "PipeEdge: Pipeline Parallelism for Large-Scale Model Inference on Heterogeneous Edge Devices," 2022 25th Euromicro Conference on Digital System Design (DSD), 2022, pp. 298-307, doi: [10.1109/DSD57027.2022.00048](https://doi.org/10.1109/DSD57027.2022.00048).
+
+```BibTex
+@INPROCEEDINGS{PipeEdge,
+  author={Hu, Yang and Imes, Connor and Zhao, Xuanang and Kundu, Souvik and Beerel, Peter A. and Crago, Stephen P. and Walters, John Paul},
+  booktitle={2022 25th Euromicro Conference on Digital System Design (DSD)},
+  title={{PipeEdge}: Pipeline Parallelism for Large-Scale Model Inference on Heterogeneous Edge Devices},
+  year={2022},
+  pages={298-307},
+  doi={10.1109/DSD57027.2022.00048}}
+```

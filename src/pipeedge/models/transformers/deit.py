@@ -1,278 +1,233 @@
 """DeiT Transformers."""
+from collections.abc import Mapping
 import logging
 import math
-import time
+from typing import Optional, Union
 import numpy as np
 import torch
 from torch import nn
+from transformers import DeiTConfig
 from transformers.models.deit.modeling_deit import DeiTEmbeddings
-from transformers.models.vit.modeling_vit import ViTLayer, ViTSelfAttention, ViTSelfOutput, ViTIntermediate, ViTOutput
-from . import TransformerShard, TransformerShardData
+from transformers.models.vit.modeling_vit import (
+    ViTIntermediate, ViTOutput, ViTSelfAttention, ViTSelfOutput
+)
+from .. import ModuleShard, ModuleShardConfig
+from . import TransformerShardData
 
 
 logger = logging.getLogger(__name__)
 
-
-def _forward_kernel(layer, x, skip, kernel_id):
-    if kernel_id == 1:
-        x = layer[0](x)
-        x = layer[1](x)[0]
-    elif kernel_id == 2:
-        x = layer[0](x, skip)
-        x += skip
-        skip = x
-    elif kernel_id == 3:
-        x = layer[0](x)
-        x = layer[1](x)
-    else:
-        x = layer[0](x, skip)
-        skip = x
-    return x, skip
+_HUB_MODEL_NAMES = {
+    'facebook/deit-base-distilled-patch16-224': 'deit_base_distilled_patch16_224',
+    'facebook/deit-small-distilled-patch16-224': 'deit_small_distilled_patch16_224',
+    'facebook/deit-tiny-distilled-patch16-224': 'deit_tiny_distilled_patch16_224',
+}
 
 
-class DeiTTransformerShard(TransformerShard):
-    """DeiT transformer shard."""
+class DeiTLayerShard(ModuleShard):
+    """Module shard based on `DeiTLayer` (copied from `.vit.ViTLayerShard`)."""
 
-    def __init__(self, stage: int, model_name: str, model_file: str, is_first: bool, is_last: bool,
-                 start_layer: int, end_layer: int, load_weight: bool=True):
-        super().__init__(stage, model_name, model_file, is_first, is_last, start_layer, end_layer,
-                         load_weight)
+    def __init__(self, config: DeiTConfig, shard_config: ModuleShardConfig):
+        super().__init__(config, shard_config)
+        self.layernorm_before = None
+        self.self_attention = None
+        self.self_output = None
+        self.layernorm_after = None
+        self.intermediate = None
+        self.output = None
+        self._build_shard()
+
+    def _build_shard(self):
+        if self.has_layer(0):
+            self.layernorm_before = nn.LayerNorm(self.config.hidden_size,
+                                                 eps=self.config.layer_norm_eps)
+            self.self_attention = ViTSelfAttention(self.config)
+        if self.has_layer(1):
+            self.self_output = ViTSelfOutput(self.config)
+        if self.has_layer(2):
+            self.layernorm_after = nn.LayerNorm(self.config.hidden_size,
+                                                eps=self.config.layer_norm_eps)
+            self.intermediate = ViTIntermediate(self.config)
+        if self.has_layer(3):
+            self.output = ViTOutput(self.config)
+
+    @torch.no_grad()
+    def forward(self, data: TransformerShardData) -> TransformerShardData:
+        """Compute layer shard."""
+        if self.has_layer(0):
+            data_norm = self.layernorm_before(data)
+            data = (self.self_attention(data_norm)[0], data)
+        if self.has_layer(1):
+            skip = data[1]
+            data = self.self_output(data[0], skip)
+            data += skip
+        if self.has_layer(2):
+            data_norm = self.layernorm_after(data)
+            data = (self.intermediate(data_norm), data)
+        if self.has_layer(3):
+            data = self.output(data[0], data[1])
+        return data
+
+
+class DeiTModelShard(ModuleShard):
+    """Module shard based on `DeiTModel`."""
+
+    def __init__(self, config: DeiTConfig, shard_config: ModuleShardConfig,
+                 model_weights: Union[str, Mapping]):
+        super().__init__(config, shard_config)
         self.embeddings = None
+        # DeiTModel uses an encoder here, but we'll just add the layers here instead.
+        # Since we just do inference, a DeiTEncoderShard class wouldn't provide real benefit.
+        self.layers = nn.ModuleList()
         self.layernorm = None
-        self.classifier = None
 
-        logger.debug(">>>> Model name: %s", model_name)
-        if self.load_weight:
-            logger.debug(">>>> Load weight file: %s", self.weights_file_name)
-            with np.load(self.weights_file_name) as weights:
-                self._make_layer(weights)
+        logger.debug(">>>> Model name: %s", self.config.name_or_path)
+        if isinstance(model_weights, str):
+            logger.debug(">>>> Load weight file: %s", model_weights)
+            with np.load(model_weights) as weights:
+                self._build_shard(weights)
         else:
-            self._make_layer(None)
+            self._build_shard(model_weights)
 
-        logger.info("======= Finish Build DeiTTransformerShard%d ==========", self.stage)
-
-    def _make_layer(self, weights):
-        ## first Shard
-        if self.is_first:
-            self.embeddings = DeiTEmbeddings(self.config)
+    def _build_shard(self, weights):
+        if self.shard_config.is_first:
             logger.debug(">>>> Load embeddings layer for the first shard")
-            if self.load_weight:
-                self._load_layer_weights(weights, 0, None, load_first = True, load_last=False, load_kernel = False, kernel_id=None)
-                logger.debug(">>>> Load weights for embeddings layer")
+            self.embeddings = DeiTEmbeddings(self.config)
+            self._load_weights_first(weights)
 
-        current_layer_idx = self.start_layer
+        layer_curr = self.shard_config.layer_start
+        while layer_curr <= self.shard_config.layer_end:
+            layer_id = math.ceil(layer_curr / 4) - 1
+            sublayer_start = (layer_curr - 1) % 4
+            if layer_id == math.ceil(self.shard_config.layer_end / 4) - 1:
+                sublayer_end = (self.shard_config.layer_end - 1) % 4
+            else:
+                sublayer_end = 3
+            logger.debug(">>>> Load layer %d, sublayers %d-%d",
+                         layer_id, sublayer_start, sublayer_end)
+            layer_config = ModuleShardConfig(layer_start=sublayer_start, layer_end=sublayer_end)
+            layer = DeiTLayerShard(self.config, layer_config)
+            self._load_weights_layer(weights, layer_id, layer)
+            self.layers.append(layer)
+            layer_curr += sublayer_end - sublayer_start + 1
 
-        ## first ununit part
-        if self.start_layer %4 != 1 or (self.start_layer+3 > self.end_layer):
-            logger.debug(">>>> For the first model part, load weight is %s:", self.load_weight)
-            for i in range(self.start_layer, min(self.end_layer, math.ceil(self.start_layer/4)*4)+1):
-                logger.debug("    Load the %d-th operation (%s) for %d-th vit layer",
-                              i%4, self.operators_list[(i-1)%4], math.ceil(i/4)-1)
-                layer = self._build_kernel(weights, i%4, math.ceil(i/4)-1, self.load_weight)
-                self.first_ops.append(layer)
-            current_layer_idx = min(self.end_layer+1, math.ceil(self.start_layer/4)*4+1)
-
-        ## mid unit part, the whole vit_layer
-        while current_layer_idx + 3 <= self.end_layer:
-            layer = ViTLayer(self.config)
-            if self.load_weight:
-                layer = self._load_layer_weights(weights, math.ceil(current_layer_idx/4)-1, layer)
-            self.vit_layers.append(layer)
-            logger.debug(">>>> Load the %d-th ViT Layer, load weight is %s",
-                          math.ceil(current_layer_idx/4)-1, self.load_weight)
-            current_layer_idx += 4
-
-        ## last unit part
-        if self.end_layer >= current_layer_idx:
-            logger.debug(">>>> For the last model part, load weight is %s:", self.load_weight)
-        for i in range(current_layer_idx, self.end_layer+1):
-            logger.debug("    Load the %d-th operation (%s) for %d-th vit layer",
-                          i%4, self.operators_list[(i-1)%4], math.ceil(i/4)-1)
-            layer = self._build_kernel(weights, i%4, math.ceil(i/4)-1, self.load_weight)
-            if self.load_weight:
-                layer = self._load_layer_weights(weights, math.ceil(i/4)-1, layer, False, False, True, i%4)
-            self.last_ops.append(layer)
-
-        ## last Shard
-        if self.is_last:
-            num_label = self.config.num_labels
-            self.layernorm = nn.LayerNorm(self.config.hidden_size, eps=self.config.layer_norm_eps)
+        if self.shard_config.is_last:
             logger.debug(">>>> Load layernorm for the last shard")
-            if self.model_name == 'google/vit-huge-patch14-224-in21k':
-                num_label = 21843
-            self.classifier = nn.Linear(self.config.hidden_size, num_label) if self.config.num_labels > 0 else nn.Identity()
-            logger.debug(">>>> Load classifier for the last shard")
-            if self.load_weight:
-                self._load_layer_weights(weights, 0, None, load_first = False, load_last=True, load_kernel = False, kernel_id=None)
-                logger.debug(">>>> Load weights for layernorm and last shard")
+            self.layernorm = nn.LayerNorm(self.config.hidden_size, eps=self.config.layer_norm_eps)
+            self._load_weights_last(weights)
 
+    @torch.no_grad()
+    def _load_weights_first(self, weights):
+        self.embeddings.cls_token.copy_(torch.from_numpy(weights["cls_token"]))
+        self.embeddings.position_embeddings.copy_(torch.from_numpy((weights["pos_embed"])))
+        self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(weights["patch_embed.proj.weight"]))
+        self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["patch_embed.proj.bias"]))
 
-        if self.load_weight:
-            logger.debug(">>>> Finish load weights")
-        else:
-            logger.debug(">>>> Do NOT load weights")
+    @torch.no_grad()
+    def _load_weights_last(self, weights):
+        self.layernorm.weight.copy_(torch.from_numpy(weights["norm.weight"]))
+        self.layernorm.bias.copy_(torch.from_numpy(weights["norm.bias"]))
 
-    def _build_kernel(self, weights, kernel_id, vit_layer_id, load_weight=True):
-        layers = nn.ModuleList()
-        if kernel_id == 1:
-            layers.append(nn.LayerNorm(self.config.hidden_size, eps=self.config.layer_norm_eps))
-            layers.append(ViTSelfAttention(self.config))
-        elif kernel_id == 2:
-            layers.append(ViTSelfOutput(self.config))
-        elif kernel_id == 3:
-            layers.append(nn.LayerNorm(self.config.hidden_size, eps=self.config.layer_norm_eps))
-            layers.append( ViTIntermediate(self.config))
-        else:
-            layers.append(ViTOutput(self.config))
-        if load_weight:
-            self._load_layer_weights(weights, vit_layer_id, layers, False, False, load_weight, kernel_id)
-        return layers
-
-    def _load_layer_weights(self, weights, id, transformer_layer, load_first = False, load_last=False, load_kernel = False, kernel_id=None):
-        ROOT = f"blocks.{id}."
-        ATTENTION_QKV = "attn.qkv."
-        ATTENTION_OUT = "attn.proj."
-        FC_0 = "mlp.fc1."
-        FC_1 = "mlp.fc2."
-        ATTENTION_NORM = "norm1."
-        MLP_NORM = "norm2."
+    @torch.no_grad()
+    def _load_weights_layer(self, weights, layer_id, layer):
+        root = f"blocks.{layer_id}."
         embed_dim = self.config.hidden_size
-        if load_first:
-            with torch.no_grad():
-                self.embeddings.position_embeddings.copy_(torch.from_numpy((weights["pos_embed"])))
-                self.embeddings.patch_embeddings.projection.weight.copy_(torch.from_numpy(weights["patch_embed.proj.weight"]))
-                self.embeddings.patch_embeddings.projection.bias.copy_(torch.from_numpy(weights["patch_embed.proj.bias"]))
-                # logger.debug(">>>> Load embedding for the first shard")
-
-        if load_last:
-            with torch.no_grad():
-                self.layernorm.weight.copy_(torch.from_numpy(weights["norm.weight"]))
-                self.layernorm.bias.copy_(torch.from_numpy(weights["norm.bias"]))
-                self.classifier.weight.copy_(torch.from_numpy(weights["head.weight"]))
-                self.classifier.bias.copy_(torch.from_numpy(weights["head.bias"]))
-                # logger.debug(">>>> Load Layernorm, classifier for the last shard")
-
-        if not load_first and not load_last:
-            with torch.no_grad():
-                if not load_kernel:
-                    qkv_f = str(ROOT + ATTENTION_QKV + "weight")
-                    qkv_weight = weights[qkv_f]
-                    query_weight = torch.from_numpy(qkv_weight[0:embed_dim,:])
-                    key_weight = torch.from_numpy(qkv_weight[embed_dim:embed_dim*2,:])
-                    value_weight = torch.from_numpy(qkv_weight[embed_dim*2:embed_dim*3,:])
-                    out_weight = torch.from_numpy(weights[ROOT + ATTENTION_OUT + "weight"])
-
-                    qkv_b = str(ROOT + ATTENTION_QKV + "bias")
-                    qkv_bias = weights[qkv_b]
-                    query_bias = torch.from_numpy(qkv_bias[0:embed_dim])
-                    key_bias = torch.from_numpy(qkv_bias[embed_dim:embed_dim*2])
-                    value_bias= torch.from_numpy(qkv_bias[embed_dim*2:embed_dim*3])
-                    out_bias = torch.from_numpy(weights[ROOT + ATTENTION_OUT + "bias"])
-
-                    transformer_layer.attention.attention.query.weight.copy_(query_weight)
-                    transformer_layer.attention.attention.key.weight.copy_(key_weight)
-                    transformer_layer.attention.attention.value.weight.copy_(value_weight)
-                    transformer_layer.attention.output.dense.weight.copy_(out_weight)
-
-                    transformer_layer.attention.attention.query.bias.copy_(query_bias)
-                    transformer_layer.attention.attention.key.bias.copy_(key_bias)
-                    transformer_layer.attention.attention.value.bias.copy_(value_bias)
-                    transformer_layer.attention.output.dense.bias.copy_(out_bias)
-
-                    mlp_weight_0 = torch.from_numpy(weights[ROOT + FC_0 + "weight"])
-                    mlp_weight_1 = torch.from_numpy(weights[ROOT + FC_1 + "weight"])
-                    mlp_bias_0 = torch.from_numpy(weights[ROOT + FC_0 + "bias"])
-                    mlp_bias_1 = torch.from_numpy(weights[ROOT + FC_1 + "bias"])
-
-                    transformer_layer.intermediate.dense.weight.copy_(mlp_weight_0)
-                    transformer_layer.intermediate.dense.bias.copy_(mlp_bias_0)
-                    transformer_layer.output.dense.weight.copy_(mlp_weight_1)
-                    transformer_layer.output.dense.bias.copy_(mlp_bias_1)
-
-                    transformer_layer.layernorm_before.weight.copy_(torch.from_numpy(weights[ROOT +  ATTENTION_NORM + "weight"]))
-                    transformer_layer.layernorm_before.bias.copy_(torch.from_numpy(weights[ROOT + ATTENTION_NORM + "bias"]))
-                    transformer_layer.layernorm_after.weight.copy_(torch.from_numpy(weights[ROOT + MLP_NORM + "weight"]))
-                    transformer_layer.layernorm_after.bias.copy_(torch.from_numpy(weights[ROOT + MLP_NORM + "bias"]))
-                    logger.debug("memory %d MB", self.process.memory_info().rss // 1000000)
-
-
-                elif kernel_id == 1:
-
-                    qkv_f = str(ROOT + ATTENTION_QKV + "weight")
-                    qkv_weight = weights[qkv_f]
-                    query_weight = torch.from_numpy(qkv_weight[0:embed_dim,:])
-                    key_weight = torch.from_numpy(qkv_weight[embed_dim:embed_dim*2,:])
-                    value_weight = torch.from_numpy(qkv_weight[embed_dim*2:embed_dim*3,:])
-
-                    qkv_b = str(ROOT + ATTENTION_QKV + "bias")
-                    qkv_bias = weights[qkv_b]
-                    query_bias = torch.from_numpy(qkv_bias[0:embed_dim,])
-                    key_bias = torch.from_numpy(qkv_bias[embed_dim:embed_dim*2])
-                    value_bias= torch.from_numpy(qkv_bias[embed_dim*2:embed_dim*3])
-
-                    transformer_layer[0].weight.copy_(torch.from_numpy(weights[ROOT +  ATTENTION_NORM + "weight"]))
-                    transformer_layer[0].bias.copy_(torch.from_numpy(weights[ROOT +  ATTENTION_NORM + "bias"]))
-                    transformer_layer[1].query.weight.copy_(query_weight)
-                    transformer_layer[1].key.weight.copy_(key_weight)
-                    transformer_layer[1].value.weight.copy_(value_weight)
-
-                    transformer_layer[1].query.bias.copy_(query_bias)
-                    transformer_layer[1].key.bias.copy_(key_bias)
-                    transformer_layer[1].value.bias.copy_(value_bias)
-
-                elif kernel_id == 2:
-                    out_weight = torch.from_numpy(weights[ROOT + ATTENTION_OUT + "weight"])
-                    out_bias = torch.from_numpy(weights[ROOT + ATTENTION_OUT + "bias"])
-                    transformer_layer[0].dense.weight.copy_(out_weight)
-                    transformer_layer[0].dense.bias.copy_(out_bias)
-                elif kernel_id == 3:
-                    transformer_layer[0].weight.copy_(torch.from_numpy(weights[ROOT + MLP_NORM + "weight"]))
-                    transformer_layer[0].bias.copy_(torch.from_numpy(weights[ROOT + MLP_NORM + "bias"]))
-                    mlp_weight_0 = torch.from_numpy(weights[ROOT + FC_0 + "weight"])
-                    mlp_bias_0 = torch.from_numpy(weights[ROOT + FC_0 + "bias"])
-                    transformer_layer[1].dense.weight.copy_(mlp_weight_0)
-                    transformer_layer[1].dense.bias.copy_(mlp_bias_0)
-                elif kernel_id == 0:
-                    mlp_weight_1 = torch.from_numpy(weights[ROOT + FC_1 + "weight"])
-                    mlp_bias_1 = torch.from_numpy(weights[ROOT + FC_1 + "bias"])
-                    transformer_layer[0].dense.weight.copy_(mlp_weight_1)
-                    transformer_layer[0].dense.bias.copy_(mlp_bias_1)
-
-        return transformer_layer
+        if layer.has_layer(0):
+            layer.layernorm_before.weight.copy_(torch.from_numpy(weights[root + "norm1.weight"]))
+            layer.layernorm_before.bias.copy_(torch.from_numpy(weights[root + "norm1.bias"]))
+            qkv_weight = weights[root + "attn.qkv.weight"]
+            layer.self_attention.query.weight.copy_(torch.from_numpy(qkv_weight[0:embed_dim,:]))
+            layer.self_attention.key.weight.copy_(torch.from_numpy(qkv_weight[embed_dim:embed_dim*2,:]))
+            layer.self_attention.value.weight.copy_(torch.from_numpy(qkv_weight[embed_dim*2:embed_dim*3,:]))
+            qkv_bias = weights[root + "attn.qkv.bias"]
+            layer.self_attention.query.bias.copy_(torch.from_numpy(qkv_bias[0:embed_dim,]))
+            layer.self_attention.key.bias.copy_(torch.from_numpy(qkv_bias[embed_dim:embed_dim*2]))
+            layer.self_attention.value.bias.copy_(torch.from_numpy(qkv_bias[embed_dim*2:embed_dim*3]))
+        if layer.has_layer(1):
+            layer.self_output.dense.weight.copy_(torch.from_numpy(weights[root + "attn.proj.weight"]))
+            layer.self_output.dense.bias.copy_(torch.from_numpy(weights[root + "attn.proj.bias"]))
+        if layer.has_layer(2):
+            layer.layernorm_after.weight.copy_(torch.from_numpy(weights[root + "norm2.weight"]))
+            layer.layernorm_after.bias.copy_(torch.from_numpy(weights[root + "norm2.bias"]))
+            layer.intermediate.dense.weight.copy_(torch.from_numpy(weights[root + "mlp.fc1.weight"]))
+            layer.intermediate.dense.bias.copy_(torch.from_numpy(weights[root + "mlp.fc1.bias"]))
+        if layer.has_layer(3):
+            layer.output.dense.weight.copy_(torch.from_numpy(weights[root + "mlp.fc2.weight"]))
+            layer.output.dense.bias.copy_(torch.from_numpy(weights[root + "mlp.fc2.bias"]))
 
     @torch.no_grad()
     def forward(self, data: TransformerShardData) -> TransformerShardData:
         """Compute shard layers."""
-        logger.debug("Start memory %d MB", self.process.memory_info().rss / 1000000)
-        start = time.time()
-        x, skip = TransformerShard.parse_forward_data(data)
+        if self.shard_config.is_first:
+            data = self.embeddings(data)
+        for layer in self.layers:
+            data = layer(data)
+        if self.shard_config.is_last:
+            data = self.layernorm(data)
+        return data
 
-        if self.is_first:
-            x = self.embeddings(x)
-            skip = x
+    # NOTE: repo has a dependency on the timm package, which isn't an automatic torch dependency
+    @staticmethod
+    def save_weights(model_name: str, model_file: str, hub_repo: str='facebookresearch/deit:main',
+                     hub_model_name: Optional[str]=None) -> None:
+        """Save the model weights file."""
+        if hub_model_name is None:
+            if model_name in _HUB_MODEL_NAMES:
+                hub_model_name = _HUB_MODEL_NAMES[model_name]
+                logger.debug("Mapping model name to torch hub equivalent: %s: %s", model_name,
+                             hub_model_name)
+            else:
+                hub_model_name = model_name
+        model = torch.hub.load(hub_repo, hub_model_name, pretrained=True)
+        state_dict = model.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        np.savez(model_file, **weights)
 
-        for i, op in enumerate(self.first_ops):
-            x, skip = _forward_kernel(op, x, skip, (self.start_layer+i)%4)
 
-        for i, layer in enumerate(self.vit_layers):
-            logger.debug("Before %d: %d MB", i, self.process.memory_info().rss / 1000000)
-            x = layer(x)[0]
-            logger.debug("After %d: %d MB", i, self.process.memory_info().rss / 1000000)
-            skip = x
-        logger.debug("vit-layer memory %d MB", self.process.memory_info().rss / 1000000)
+class DeiTShardForImageClassification(ModuleShard):
+    """Module shard based on `DeiTForImageClassification`."""
 
-        for i, op in enumerate(self.last_ops):
-            # could drop modulus since 0<=i<4, but making 0<=kernel_id<4 is at least consistent with _load_layer_weights()
-            x, skip = _forward_kernel(op, x, skip, (i+1)%4)
+    def __init__(self, config: DeiTConfig, shard_config: ModuleShardConfig,
+                 model_weights: Union[str, Mapping]):
+        super().__init__(config, shard_config)
+        self.deit = None
+        self.classifier = None
 
-        if self.is_last:
-            x = self.layernorm(x)
-            x = self.classifier(x[:, 0, :])
-        end = time.time()
+        logger.debug(">>>> Model name: %s", self.config.name_or_path)
+        if isinstance(model_weights, str):
+            logger.debug(">>>> Load weight file: %s", model_weights)
+            with np.load(model_weights) as weights:
+                self._build_shard(weights)
+        else:
+            self._build_shard(model_weights)
 
-        logger.info("Shard%d: computed microbatch in: %f sec", self.stage, end - start)
-        logger.info("Shard%d: memory: %d MB", self.stage, self.process.memory_info().rss / 1000000)
+    def _build_shard(self, weights):
+        ## all shards use the inner DeiT model
+        self.deit = DeiTModelShard(self.config, self.shard_config, weights)
 
-        if self.end_layer % 2 == 0:
-            return x
-        return x, skip
+        if self.shard_config.is_last:
+            logger.debug(">>>> Load classifier for the last shard")
+            self.classifier = nn.Linear(self.config.hidden_size, self.config.num_labels) if self.config.num_labels > 0 else nn.Identity()
+            self._load_weights_last(weights)
+
+    @torch.no_grad()
+    def _load_weights_last(self, weights):
+        self.classifier.weight.copy_(torch.from_numpy(weights["head.weight"]))
+        self.classifier.bias.copy_(torch.from_numpy(weights["head.bias"]))
+
+    @torch.no_grad()
+    def forward(self, data: TransformerShardData) -> TransformerShardData:
+        """Compute shard layers."""
+        data = self.deit(data)
+        if self.shard_config.is_last:
+            data = self.classifier(data[:, 0, :])
+        return data
+
+    @staticmethod
+    def save_weights(model_name: str, model_file: str, hub_repo: str='facebookresearch/deit:main',
+                     hub_model_name: Optional[str]=None) -> None:
+        """Save the model weights file."""
+        DeiTModelShard.save_weights(model_name, model_file, hub_repo=hub_repo,
+                                    hub_model_name=hub_model_name)

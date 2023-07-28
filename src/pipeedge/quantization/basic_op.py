@@ -1,4 +1,5 @@
 """ Basic operations used for Quantization """
+from typing import List
 import numpy as np
 import torch
 
@@ -105,13 +106,20 @@ def _uint8_to_uint32(tensor):
     return tensor.view('uint32')
 
 
-def tensor_encode(input_data, quant_bit, clamp_value=None):
+def compression_factor(quant_bit: torch.Tensor) -> torch.Tensor:
+    """Compute the compression factor (data size improvement) for quantization bit widths > 0."""
+    return torch.div(32, quant_bit)
+
+
+def tensor_encode(input_data: torch.Tensor, quant_bit: int) -> List[torch.Tensor]:
     """
         The input to the encoder should be a torch.Tensor
         We first cast it to a np.array, then do everything else
     """
+    quant_bit_tensor = torch.tensor(quant_bit, dtype = torch.int8)
     if quant_bit == 0:
-        return [input_data, torch.tensor(input_data.shape), torch.tensor(1.0), torch.tensor(0.0)]
+        return [input_data, torch.tensor(input_data.shape), torch.tensor(1.0), torch.tensor(0.0),
+                quant_bit_tensor]
 
     input_data = input_data.numpy()
     if isinstance(clamp_value, torch.Tensor):
@@ -142,13 +150,14 @@ def tensor_encode(input_data, quant_bit, clamp_value=None):
     shift = torch.tensor(shift, dtype = torch.float32)
 
     # scale_factor is needed to restore the tensor
-    return [comm_tensor, shape, scale_factor, shift]
+    return [comm_tensor, shape, scale_factor, shift, quant_bit_tensor]
 
 
-def tensor_decode(comm_tensor, input_shape, scale_factor, shift, quant_bit):
+def tensor_decode(encodings: List[torch.Tensor]) -> torch.Tensor:
     """
         decode the compressed tensor with uint8 value
     """
+    comm_tensor, input_shape, scale_factor, shift, quant_bit = encodings
     if quant_bit == 0:
         return comm_tensor
 
@@ -158,6 +167,20 @@ def tensor_decode(comm_tensor, input_shape, scale_factor, shift, quant_bit):
     input_shape = input_shape.tolist()
     scale_factor = scale_factor.item()
     shift = shift.item()
+    quant_bit = quant_bit.item()
     restore_int_map = _intmap_decode(comm_tensor, input_shape, quant_bit)
     restore_tensor = _intmap2float(restore_int_map, quant_bit)
     return torch.from_numpy((restore_tensor*scale_factor+shift).astype(np.float32))
+
+
+def tensor_encode_outerdim(batched_tensor: torch.Tensor, quant_bit: int) -> List[torch.Tensor]:
+    """do quantization on each image in the micro-batched tensor with size [b,c,h,w]"""
+    list_of_lists = [tensor_encode(t, quant_bit) for t in batched_tensor]
+    encoded_tensors = list(zip(*list_of_lists))
+    return [torch.stack(t,0) for t in encoded_tensors]
+
+
+def tensor_decode_outerdim(batched_encodings: List[torch.Tensor]) -> torch.Tensor:
+    """decode the encoded tensor with multiple images in one batch, each encoded image data is in length of 5"""
+    tensors = [tensor_decode(encodings) for encodings in zip(*batched_encodings)]
+    return torch.stack(tensors, 0)
