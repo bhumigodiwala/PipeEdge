@@ -122,21 +122,11 @@ def tensor_encode(input_data: torch.Tensor, quant_bit: int) -> List[torch.Tensor
                 quant_bit_tensor]
 
     input_data = input_data.numpy()
-    if isinstance(clamp_value, torch.Tensor):
-        clamp_value = clamp_value.item()
-    elif isinstance(clamp_value, np.ndarray):
-        clamp_value = np.asscalar(clamp_value)
     shape = input_data.shape
     # ensure the input is scaled to [0,1],
-    if clamp_value:
-        shift = -clamp_value if input_data.min()>(-clamp_value) else input_data.min()
-    else:
-        shift = input_data.min()
+    shift = input_data.min()
     input_data = input_data - shift
-    if clamp_value:
-        scale_factor = (clamp_value + shift) if  input_data.max()<(clamp_value + shift) else input_data.max()
-    else:
-        scale_factor = input_data.max()
+    scale_factor = input_data.max()
     rescale_input = input_data/scale_factor
     # quant
     _, int_map = _quant_op(rescale_input, quant_bit)

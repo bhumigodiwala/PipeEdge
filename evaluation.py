@@ -4,13 +4,13 @@ import argparse
 import time
 import numpy as np
 import torch
+from typing import List
 from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 from torchvision.transforms import ToTensor, Normalize, Resize, Compose
 from transformers import DeiTFeatureExtractor, ViTFeatureExtractor
-from src.pipeedge.quantization.hook import forward_hook_quant_encode, forward_hook_quant_encode_with_clamp, forward_pre_hook_quant_decode
-from src.pipeedge.quantization.clamp_op import clamp_factor
-from runtime import _get_default_quant
+from runtime import forward_hook_quant_encode, forward_pre_hook_quant_decode
+from src.pipeedge.quantization.clamp_op import _clamp_factor_gelu
 import model_cfg
 
 PLOT_BINS = 200
@@ -47,6 +47,9 @@ def RML_test(x):
     beta = estimate_beta(x)
     T = np.log(np.sqrt(alpha)) - np.log(beta) - 0.27421
     return T, (alpha, beta)
+
+def _get_default_quant(n_stages: int) -> List[int]:
+    return [0] * n_stages
 
 def fitting_with_search(norm_hist, theo_xaxi, fitting_parameter, fitting_type = 'laplace', search_steps=100):
     if fitting_type == 'laplace':
@@ -95,8 +98,8 @@ def clamp_with_minimalMSE(input, bit, layer_type='normal'):
         fitting_parameter = alpha_hat
     # near-neighbor search
     best_parameter = fitting_with_search(norm_hist_x, theo_xaxi, fitting_parameter, fitting_type=fitting_type)
-    optimal_clamp_range = clamp_factor[layer_type][fitting_type][bit] * best_parameter
-    # optimal_clamp_range = clamp_factor[layer_type][fitting_type][bit] * fitting_parameter
+    optimal_clamp_range = _clamp_factor_gelu(bit) * best_parameter
+    # optimal_clamp_range = _clamp_factor_gelu[layer_type][fitting_type][bit] * fitting_parameter
     optimal_clamp_range = torch.tensor(optimal_clamp_range).float()
 
     # clamp
@@ -164,7 +167,6 @@ def _forward_model(input_tensor, model_shards, stage_layers, is_clamp=True, mode
             temp_tensor = forward_pre_hook_quant_decode(shard, temp_tensor)
 
         # forward
-        # import ipdb; ipdb.set_trace()
         if isinstance(temp_tensor[0], tuple) and len(temp_tensor[0]) == 2:
             temp_tensor = temp_tensor[0]
         elif isinstance(temp_tensor, tuple) and isinstance(temp_tensor[0], torch.Tensor):
@@ -174,46 +176,46 @@ def _forward_model(input_tensor, model_shards, stage_layers, is_clamp=True, mode
         # encoder
         if idx != num_shards-1:
             # defination of position where distribution diverse
-            if model_name == 'google/vit-base-patch16-224':
-                half_point = 19
+            # if model_name == 'google/vit-base-patch16-224':
+            #     half_point = 19
             # clamp
-            if is_clamp:
-                # x,skip
-                clamp_types=[]
-                if stage_layers[idx][1] % 4 in [1]:
-                    if stage_layers[idx][1] < half_point:
-                        clamp_types = ['normal', 'normal'] # manully selected ['good', 'good']
-                    else:
-                        clamp_types = ['normal', 'normal'] # manully selected ['good', 'normal']
-                elif stage_layers[idx][1] % 4 in [2,0]:
-                    if stage_layers[idx][1] < half_point:
-                        clamp_types = ['normal', 'normal'] # manully selected ['good', 'good']
-                    else:
-                        clamp_types = ['normal', 'normal']
-                else:
-                    if stage_layers[idx][1] <= half_point:
-                        clamp_types = ['normal', 'normal'] # manully selected ['GeLU', 'good']
-                    else:
-                        clamp_types = ['normal', 'normal'] # manully selected ['GeLU', 'normal']
-                # do clamp
-                temp_tensors_list = []
-                temp_clamp_list = []
-                if len(temp_tensor) == 2:
-                    for tensor_idx, tensor in enumerate(temp_tensor):
-                        result_tensor, clamp_value = clamp_with_minimalMSE(tensor, shard.quant_bits[1].item(), layer_type=clamp_types[tensor_idx])
-                        temp_tensors_list.append(result_tensor)
-                        temp_clamp_list.append(clamp_value)
-                    temp_tensor = tuple(temp_tensors_list)
-                elif len(temp_tensor) == 1:
-                    if isinstance(temp_tensor, tuple):
-                        temp_tensor = temp_tensor[0]
-                    temp_tensor, clamp_value = clamp_with_minimalMSE(temp_tensor, shard.quant_bits[1].item(), layer_type=clamp_types[0])
-                    temp_clamp_list.append(clamp_value)
-                    temp_tensor = (temp_tensor,)
-                # do encoder
-                temp_tensor = (forward_hook_quant_encode_with_clamp(shard, None, temp_tensor, temp_clamp_list),)
-            else:
-                temp_tensor = (forward_hook_quant_encode(shard, None, temp_tensor),)
+            # if is_clamp:
+            #     # x,skip
+            #     clamp_types=[]
+            #     if stage_layers[idx][1] % 4 in [1]:
+            #         if stage_layers[idx][1] < half_point:
+            #             clamp_types = ['normal', 'normal'] # manully selected ['good', 'good']
+            #         else:
+            #             clamp_types = ['normal', 'normal'] # manully selected ['good', 'normal']
+            #     elif stage_layers[idx][1] % 4 in [2,0]:
+            #         if stage_layers[idx][1] < half_point:
+            #             clamp_types = ['normal', 'normal'] # manully selected ['good', 'good']
+            #         else:
+            #             clamp_types = ['normal', 'normal']
+            #     else:
+            #         if stage_layers[idx][1] <= half_point:
+            #             clamp_types = ['normal', 'normal'] # manully selected ['GeLU', 'good']
+            #         else:
+            #             clamp_types = ['normal', 'normal'] # manully selected ['GeLU', 'normal']
+            #     # do clamp
+            #     temp_tensors_list = []
+            #     temp_clamp_list = []
+            #     if len(temp_tensor) == 2:
+            #         for tensor_idx, tensor in enumerate(temp_tensor):
+            #             result_tensor, clamp_value = clamp_with_minimalMSE(tensor, shard.quant_bits[1].item(), layer_type=clamp_types[tensor_idx])
+            #             temp_tensors_list.append(result_tensor)
+            #             temp_clamp_list.append(clamp_value)
+            #         temp_tensor = tuple(temp_tensors_list)
+            #     elif len(temp_tensor) == 1:
+            #         if isinstance(temp_tensor, tuple):
+            #             temp_tensor = temp_tensor[0]
+            #         temp_tensor, clamp_value = clamp_with_minimalMSE(temp_tensor, shard.quant_bits[1].item(), layer_type=clamp_types[0])
+            #         temp_clamp_list.append(clamp_value)
+            #         temp_tensor = (temp_tensor,)
+            #     # do encoder
+            #     temp_tensor = (forward_hook_quant_encode(shard, None, temp_tensor),)
+            # else:
+            temp_tensor = (forward_hook_quant_encode(shard, None, temp_tensor),)
     return temp_tensor
 
 def evaluation(args):
@@ -265,6 +267,7 @@ def evaluation(args):
     for stage in range(num_shards):
         q_bits = torch.tensor((0 if stage == 0 else stage_quant[stage - 1], stage_quant[stage]))
         model_shards.append(_make_shard(model_name, model_file, stage_layers, stage, q_bits))
+        model_shards[-1].register_buffer('quant_bit', torch.tensor(stage_quant[stage]), persistent=False)
 
     # run inference
     start_time = time.time()
