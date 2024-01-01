@@ -3,6 +3,53 @@ from typing import List
 import numpy as np
 import torch
 
+import torch 
+import torch.nn.functional as F
+
+def _adaptive_quant_op(input_data, n_bits=4, n_exp=2, bias = None):
+    
+    n_mant = n_bits-1-n_exp
+    input_data = torch.Tensor(input_data)
+    # 1. store sign value and do the following part as unsigned value
+    sign = torch.sign(input_data)
+    input_data = torch.abs(input_data)
+    
+    if (bias == None):
+       bias_temp = torch.frexp(input_data.max())[1]-1
+       bias = (2**(n_exp-1) - 1) - bias_temp
+        
+    # 2. limits the range of output float point
+    min_exp = -2**(n_exp-1)+2-bias 
+    max_exp = 2**(n_exp-1)-1-bias 
+    
+    min_value = 2.**min_exp
+    max_value = (2.**max_exp)*(2-2**(-n_mant))
+
+    # Non denormal part 
+    input_data[input_data < min_value] = 0
+    
+    ## 2.2. reduce too large values to max value of output format
+    input_data[input_data > max_value] = max_value
+    
+    # 3. get mant, exp (the format is different from IEEE float)
+    mant, exp = torch.frexp(input_data)
+    
+    # 3.1 change mant, and exp format to IEEE float format
+    # no effect for exponent of 0 outputs
+    mant = 2*mant
+    exp = exp-1
+   
+    power_exp = torch.exp2(exp)
+    ## 4. quantize mantissa
+    scale = 2**(-n_mant) ## e.g. 2 bit, scale = 0.25
+    mant = ((mant/scale).round())*scale
+    
+    float_out = sign*power_exp*mant
+    int_map= float_out.numpy().copy()
+    int_map = int_map.astype(np.uint32)
+    
+    return float_out,int_map
+
 def _quant_op(input_data, bit, mode='original'):
     """
     The input and output should be all on the interval [0, 1].
@@ -129,7 +176,10 @@ def tensor_encode(input_data: torch.Tensor, quant_bit: int) -> List[torch.Tensor
     scale_factor = input_data.max()
     rescale_input = input_data/scale_factor
     # quant
-    _, int_map = _quant_op(rescale_input, quant_bit)
+    
+    # _, int_map = _quant_op(rescale_input, quant_bit)
+    _, int_map = _adaptive_quant_op(rescale_input, quant_bit)
+    
     comm_tensor = _intmap_encode(int_map, quant_bit)
     # split uint32 into 4 uint8
     comm_tensor = _uint32_to_uint8(comm_tensor)

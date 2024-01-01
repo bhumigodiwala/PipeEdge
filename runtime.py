@@ -13,14 +13,14 @@ import requests
 import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, DeiTFeatureExtractor, ViTFeatureExtractor
-from pipeedge.comm.p2p import DistP2pContext
-from pipeedge.comm.rpc import DistRpcContext, tensorpipe_rpc_backend_options_factory
-from pipeedge import models
-from pipeedge.quantization.basic_op import (
+from src.pipeedge.comm.p2p import DistP2pContext
+from src.pipeedge.comm.rpc import DistRpcContext, tensorpipe_rpc_backend_options_factory
+from src.pipeedge import models
+from src.pipeedge.quantization.basic_op import (
     compression_factor, tensor_encode_outerdim, tensor_decode_outerdim
 )
-from pipeedge.quantization.clamp_op import clamp_banner2019_gelu, clamp_banner2019_laplace
-from pipeedge.sched.scheduler import sched_pipeline
+from src.pipeedge.quantization.clamp_op import clamp_banner2019_gelu, clamp_banner2019_laplace
+from src.pipeedge.sched.scheduler import sched_pipeline
 import devices
 import model_cfg
 import monitoring
